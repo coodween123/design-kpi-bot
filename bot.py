@@ -4,7 +4,7 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BOT_TOKEN = "8956099107:AAHV7rykQEdon9w6dY_ANr7IuRsb5yx5Bvw"
+BOT_TOKEN = "ТОКЕН"
 DB_NAME = "design_kpi_bot.db"
 
 
