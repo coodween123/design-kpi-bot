@@ -1,6 +1,10 @@
 import os
+import csv
+import io
 import json
+import html
 import sqlite3
+import zipfile
 import logging
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
@@ -10,6 +14,11 @@ from typing import Any, Optional, Tuple, List
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
+
+try:
+    from telegram.ext import MessageReactionHandler
+except ImportError:
+    MessageReactionHandler = None
 
 DB_PATH = os.getenv("DB_PATH", "design_kpi_bot.sqlite3")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -78,6 +87,12 @@ def user_name(update: Update) -> str:
     if not u:
         return "unknown"
     return f"@{u.username}" if u.username else f"id:{u.id}"
+
+
+def user_name_from_user(user) -> str:
+    if not user:
+        return "unknown"
+    return f"@{user.username}" if user.username else f"id:{user.id}"
 
 
 def html_quote_code(text: str) -> str:
@@ -192,10 +207,31 @@ def init_db() -> None:
             sent_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS deadline_alerts (
+            task_id INTEGER PRIMARY KEY,
+            alerted_at TEXT NOT NULL,
+            notified_user TEXT,
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS task_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            thread_id INTEGER,
+            message_type TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(chat_id, message_id),
+            FOREIGN KEY(task_id) REFERENCES tasks(id)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
         CREATE INDEX IF NOT EXISTS idx_tasks_completed_month ON tasks(completed_month);
         CREATE INDEX IF NOT EXISTS idx_tasks_created_month ON tasks(created_month);
         CREATE INDEX IF NOT EXISTS idx_tasks_accepted_by ON tasks(accepted_by);
+        CREATE INDEX IF NOT EXISTS idx_tasks_deadline ON tasks(deadline);
+        CREATE INDEX IF NOT EXISTS idx_task_messages_lookup ON task_messages(chat_id, message_id);
         CREATE INDEX IF NOT EXISTS idx_task_log_created_at ON task_log(created_at);
         CREATE INDEX IF NOT EXISTS idx_bot_actions_created_at ON bot_actions(created_at);
         CREATE INDEX IF NOT EXISTS idx_bot_actions_command ON bot_actions(command);
@@ -214,12 +250,70 @@ def get_setting(key: str) -> Optional[str]:
         return row["value"] if row else None
 
 
+def get_log_chat_id() -> Optional[int]:
+    chat_id = get_setting("log_chat_id")
+    if chat_id:
+        try:
+            return int(chat_id)
+        except ValueError:
+            logger.warning("Invalid log_chat_id setting: %s", chat_id)
+    with db() as conn:
+        row = conn.execute("SELECT key FROM settings WHERE key LIKE 'log_topic:%' ORDER BY key LIMIT 1").fetchone()
+    if not row:
+        return None
+    try:
+        return int(row["key"].split(":", 1)[1])
+    except (IndexError, ValueError):
+        logger.warning("Invalid log topic setting key: %s", row["key"])
+        return None
+
+
 def log_action(task_id: Optional[int], action: str, user: str, comment: str = "", old_status: str = "", new_status: str = "") -> None:
     with db() as conn:
         conn.execute(
             "INSERT INTO task_log(created_at,task_id,action,user,comment,old_status,new_status) VALUES(?,?,?,?,?,?,?)",
             (now_iso(), task_id, action, user, comment, old_status, new_status),
         )
+
+
+def remember_task_message(task_id: int, message, message_type: str) -> None:
+    if not message:
+        return
+    try:
+        chat_id = message.chat.id
+        message_id = message.message_id
+        thread_id = getattr(message, "message_thread_id", None)
+    except AttributeError:
+        return
+    with db() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO task_messages(task_id,chat_id,message_id,thread_id,message_type,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (task_id, chat_id, message_id, thread_id, message_type, now_iso()),
+        )
+
+
+def task_message_by_reaction(chat_id: int, message_id: int):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM task_messages WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone()
+
+
+def is_active_designer(username: str) -> bool:
+    variants = {username}
+    if username.startswith("@"):
+        variants.add(username[1:])
+    else:
+        variants.add(f"@{username}")
+    placeholders = ",".join("?" for _ in variants)
+    with db() as conn:
+        row = conn.execute(
+            f"SELECT username FROM designers WHERE active=1 AND lower(username) IN ({placeholders})",
+            tuple(v.lower() for v in variants),
+        ).fetchone()
+    return row is not None
 
 
 def log_command_start(command: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
@@ -287,10 +381,10 @@ def save_stats_snapshot(month: str, scope: str, requested_by: str, payload: dict
         logger.warning("Cannot save stats snapshot: %s", e)
 
 
-async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
     topic = get_setting(f"log_topic:{chat_id}")
     try:
-        await context.bot.send_message(
+        return await context.bot.send_message(
             chat_id=chat_id,
             message_thread_id=int(topic) if topic else None,
             text=text,
@@ -298,6 +392,7 @@ async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) 
         )
     except Exception as e:
         logger.warning("Cannot send log: %s", e)
+        return None
 
 
 def task_by_id(task_id: int):
@@ -444,6 +539,164 @@ def top_payload(month: str) -> dict[str, Any]:
     }
 
 
+HISTORY_FIELDS = [
+    "Месяц",
+    "ID",
+    "Дизайнер",
+    "Название",
+    "Описание",
+    "Автор",
+    "Создана",
+    "Принята",
+    "Завершена",
+    "Закрыл",
+    "Дедлайн",
+    "Срок",
+    "Правки",
+    "Доработок",
+]
+
+HISTORY_SUMMARY_FIELDS = [
+    "Дизайнер",
+    "Месяц",
+    "Выполнено",
+    "В срок",
+    "Просрочено",
+    "До 3 правок",
+    "Более 3 правок",
+    "Среднее время выполнения",
+]
+
+
+def safe_filename_part(value: str) -> str:
+    cleaned = value.strip().strip("@") or "unknown"
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in cleaned)
+
+
+def parse_history_args(args: list[str]) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    month: Optional[str] = current_month()
+    designer: Optional[str] = None
+    for arg in args:
+        item = arg.strip()
+        if not item:
+            continue
+        if item.lower() == "all":
+            month = None
+        elif item.startswith("@") or item.startswith("id:"):
+            designer = item
+        else:
+            try:
+                datetime.strptime(item, "%m.%Y")
+            except ValueError:
+                return None, None, "Месяц нужен в формате 06.2026 или используйте all."
+            month = item
+    return month, designer, None
+
+
+def completed_history_rows(month: Optional[str], designer: Optional[str] = None):
+    query = "SELECT * FROM tasks WHERE status=? AND completed_at IS NOT NULL"
+    args: list[Any] = [STATUSES["done"]]
+    if month:
+        query += " AND completed_month=?"
+        args.append(month)
+    if designer:
+        query += " AND (accepted_by=? OR completed_by=?)"
+        args.extend([designer, designer])
+    query += " ORDER BY completed_at ASC, accepted_by ASC"
+    with db() as conn:
+        return conn.execute(query, args).fetchall()
+
+
+def task_designer(row) -> str:
+    return row["accepted_by"] or row["completed_by"] or "—"
+
+
+def month_sort_key(value: str) -> tuple[int, int]:
+    try:
+        month, year = value.split(".", 1)
+        return int(year), int(month)
+    except (ValueError, AttributeError):
+        return 9999, 99
+
+
+def history_record(row) -> dict[str, Any]:
+    quality = "—"
+    if row["quality_flag"] == 0:
+        quality = "до 3 правок"
+    elif row["quality_flag"] == 1:
+        quality = "более 3 правок"
+    deadline_status = "—"
+    if row["on_time"] == 1:
+        deadline_status = "в срок"
+    elif row["on_time"] == 0:
+        deadline_status = "просрочен"
+    return {
+        "Месяц": row["completed_month"] or "—",
+        "ID": row["id"],
+        "Дизайнер": task_designer(row),
+        "Название": row["title"],
+        "Описание": row["description"] or "",
+        "Автор": row["created_by"],
+        "Создана": fmt_dt(row["created_at"]),
+        "Принята": fmt_dt(row["accepted_at"]),
+        "Завершена": fmt_dt(row["completed_at"]),
+        "Закрыл": row["completed_by"] or "—",
+        "Дедлайн": fmt_dt(row["deadline"]),
+        "Срок": deadline_status,
+        "Правки": quality,
+        "Доработок": row["rework_count"],
+    }
+
+
+def csv_bytes(records: list[dict[str, Any]], fields: list[str]) -> bytes:
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(output, fieldnames=fields, delimiter=";")
+    writer.writeheader()
+    writer.writerows(records)
+    return output.getvalue().encode("utf-8-sig")
+
+
+def history_summary_records(rows) -> list[dict[str, Any]]:
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[(task_designer(row), row["completed_month"] or "—")].append(row)
+    summary = []
+    for (designer, month), items in sorted(grouped.items(), key=lambda x: (x[0][0], month_sort_key(x[0][1]))):
+        summary.append({
+            "Дизайнер": designer,
+            "Месяц": month,
+            "Выполнено": len(items),
+            "В срок": sum(1 for r in items if r["on_time"] == 1),
+            "Просрочено": sum(1 for r in items if r["on_time"] == 0),
+            "До 3 правок": sum(1 for r in items if r["quality_flag"] == 0),
+            "Более 3 правок": sum(1 for r in items if r["quality_flag"] == 1),
+            "Среднее время выполнения": human_duration(avg_completion(items)),
+        })
+    return summary
+
+
+def build_history_zip(rows, month: Optional[str], designer: Optional[str]) -> tuple[bytes, str]:
+    all_records = [history_record(row) for row in rows]
+    period = month.replace(".", "-") if month else "all"
+    designer_part = f"_{safe_filename_part(designer)}" if designer else ""
+    filename = f"design_kpi_history_{period}{designer_part}.zip"
+
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("all_tasks.csv", csv_bytes(all_records, HISTORY_FIELDS))
+        zf.writestr("summary_by_designer.csv", csv_bytes(history_summary_records(rows), HISTORY_SUMMARY_FIELDS))
+
+        by_designer = defaultdict(list)
+        for row in rows:
+            by_designer[task_designer(row)].append(row)
+        for name, designer_rows in sorted(by_designer.items()):
+            records = [history_record(row) for row in designer_rows]
+            zf.writestr(f"designer_{safe_filename_part(name)}.csv", csv_bytes(records, HISTORY_FIELDS))
+
+    archive.seek(0)
+    return archive.getvalue(), filename
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await help_cmd(update, context)
 
@@ -461,9 +714,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔷 /task — создать задачу
 
 Пример:
-{html_quote_code('/task Баннер VK | 31.07.2026 18:00 | Сделать баннер для рекламы курса')}
+{html_quote_code('/task Обложка, 31.07.2026 18:00, сделать дизайн обложки')}
 
 🔷 /ok — взять задачу
+
+Можно также поставить любую реакцию на сообщение бота о задаче — если реакцию ставит активный дизайнер, задача примется на него.
 
 Пример:
 {html_quote_code('/ok 15')}
@@ -514,6 +769,12 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 🔷 /top
 
+🔷 /history — скачать историю выполненных задач
+
+Примеры:
+{html_quote_code('/history 07.2026')}
+{html_quote_code('/history all @anna')}
+
 ━━━━━━━━━━━━━━
 
 <b>📅 График работы</b>
@@ -524,6 +785,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 {html_quote_code('/online 05.08.2026')}
 
 🔷 /week
+
+🔷 /time — текущее время по Москве
 
 ━━━━━━━━━━━━━━
 
@@ -608,22 +871,63 @@ async def setup_commands(app: Application):
         BotCommand("stats", "🔷 статистика команды"),
         BotCommand("report", "🔷 месячный отчёт"),
         BotCommand("top", "🔷 рейтинг"),
+        BotCommand("history", "🔷 история задач файлом"),
         BotCommand("online", "🔷 кто сегодня работает"),
         BotCommand("week", "🔷 график на 7 дней"),
+        BotCommand("time", "🔷 время по Москве"),
         BotCommand("adminhelp", "🔷 технические команды"),
     ])
 
+
+async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"🕒 Сейчас по Москве: {now_msk().strftime(DATETIME_FMT)}")
+
+
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month, designer, error = parse_history_args(context.args or [])
+    if error:
+        await update.message.reply_text(f"❌ {error}\n\nПримеры:\n/history 07.2026\n/history all\n/history 07.2026 @anna")
+        return
+
+    rows = completed_history_rows(month, designer)
+    if not rows:
+        period_text = month or "вся история"
+        designer_text = f" для {designer}" if designer else ""
+        await update.message.reply_text(f"✅ Выполненных задач за период {period_text}{designer_text} не найдено.")
+        return
+
+    data, filename = build_history_zip(rows, month, designer)
+    file_obj = io.BytesIO(data)
+    file_obj.name = filename
+    period_text = month or "вся история"
+    designer_text = f"\nДизайнер: {designer}" if designer else "\nДизайнеры: все"
+    caption = (
+        f"📦 История выполненных задач\n"
+        f"Период: {period_text}"
+        f"{designer_text}\n"
+        f"Задач: {len(rows)}"
+    )
+    await update.message.reply_document(document=file_obj, filename=filename, caption=caption)
+
+
 async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
-    parts = [p.strip() for p in raw.split("|", 2)]
+    parts = [p.strip() for p in raw.split(",", 2)]
     if len(parts) != 3:
-        await update.message.reply_text("❌ Формат: /task Название | 31.07.2026 18:00 | Описание")
+        await update.message.reply_text("❌ Формат: /task Название, 31.07.2026 18:00, Описание")
         return
     title, deadline_s, desc = parts
+    if not title or not deadline_s or not desc:
+        await update.message.reply_text("❌ Заполните название, дедлайн и описание.\nФормат: /task Название, 31.07.2026 18:00, Описание")
+        return
     try:
         deadline = parse_dt(deadline_s)
     except ValueError:
         await update.message.reply_text("❌ Дедлайн нужен в формате: 31.07.2026 18:00")
+        return
+    current_msk = now_msk()
+    if deadline <= current_msk:
+        await update.message.reply_text(f"❌ Нельзя создать задачу с дедлайном в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
     creator = user_name(update)
     created_at = now_iso()
@@ -635,8 +939,10 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         task_id = cur.lastrowid
     log_action(task_id, "create", creator, title, "", STATUSES["waiting"])
-    await update.message.reply_text(f"✅ Задача #{task_id} создана. Статус: ожидает принятия.")
-    await send_log(context, update.effective_chat.id, f"<b>✅ Создана задача #{task_id}</b>\n\n<b>{title}</b>\nДедлайн: {deadline.strftime(DATETIME_FMT)}\nАвтор: {creator}\n\n{desc}")
+    reply_msg = await update.message.reply_text(f"✅ Задача #{task_id} создана. Статус: ожидает принятия.")
+    remember_task_message(task_id, reply_msg, "task_reply")
+    log_msg = await send_log(context, update.effective_chat.id, f"<b>✅ Создана задача #{task_id}</b>\n\n<b>{title}</b>\nДедлайн: {deadline.strftime(DATETIME_FMT)}\nАвтор: {creator}\n\n{desc}")
+    remember_task_message(task_id, log_msg, "task_log")
 
 
 async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,6 +963,45 @@ async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_action(task_id, "accept", executor, "", row["status"], STATUSES["in_progress"])
     await update.message.reply_text(f"🔵 Задача #{task_id} принята в работу. Исполнитель: {executor}")
     await send_log(context, update.effective_chat.id, f"<b>🔵 Задача #{task_id} принята</b>\nИсполнитель: {executor}")
+
+
+async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reaction = getattr(update, "message_reaction", None)
+    if not reaction or not reaction.new_reaction:
+        return
+    if not reaction.user:
+        return
+
+    executor = user_name_from_user(reaction.user)
+    if not is_active_designer(executor):
+        return
+
+    message_link = task_message_by_reaction(reaction.chat.id, reaction.message_id)
+    if not message_link:
+        return
+
+    task_id = message_link["task_id"]
+    row = task_by_id(task_id)
+    if not row or row["status"] != STATUSES["waiting"] or row["accepted_by"]:
+        return
+
+    accepted_at = now_iso()
+    with db() as conn:
+        conn.execute(
+            "UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?",
+            (executor, accepted_at, STATUSES["in_progress"], task_id),
+        )
+    log_action(task_id, "accept_reaction", executor, f"reaction_message_id={reaction.message_id}", row["status"], STATUSES["in_progress"])
+
+    text = f"<b>🔵 Задача #{task_id} принята реакцией</b>\nИсполнитель: {html.escape(executor)}"
+    await context.bot.send_message(
+        chat_id=reaction.chat.id,
+        message_thread_id=message_link["thread_id"],
+        text=text,
+        parse_mode=ParseMode.HTML,
+    )
+    if reaction.chat.id != get_log_chat_id():
+        await send_log(context, reaction.chat.id, text)
 
 
 async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -684,7 +1029,12 @@ async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
-        await update.message.reply_text("❌ Формат: /done ID 0/1")
+        await update.message.reply_text(
+            "❌ Формат: /done ID 0/1\n\n"
+            "0 — до 3 правок\n"
+            "1 — больше 3 правок\n\n"
+            "Пример: /done 15 0"
+        )
         return
     task_id = int(context.args[0])
     qflag = int(context.args[1])
@@ -695,6 +1045,7 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     completed_at = now_msk()
     deadline = parse_iso_msk(row["deadline"])
     on_time = 1 if completed_at <= deadline else 0
+    deadline_status = "в срок" if on_time else "просрочен"
     actor = user_name(update)
     with db() as conn:
         conn.execute(
@@ -702,8 +1053,8 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             (actor, completed_at.isoformat(timespec="seconds"), STATUSES["done"], qflag, on_time, month_key(completed_at), task_id),
         )
     log_action(task_id, "done", actor, f"quality={qflag}; on_time={on_time}", row["status"], STATUSES["done"])
-    await update.message.reply_text(f"🟢 Задача #{task_id} завершена. В срок: {'да' if on_time else 'нет'}. Правки: {'более 3' if qflag else 'до 3'}.")
-    await send_log(context, update.effective_chat.id, f"<b>🟢 Завершена задача #{task_id}</b>\nВ срок: {'да' if on_time else 'нет'}\nПравки: {'более 3' if qflag else 'до 3'}\nЗакрыл: {actor}")
+    await update.message.reply_text(f"🟢 Задача #{task_id} завершена. Срок: {deadline_status}. Правки: {'более 3' if qflag else 'до 3'}.")
+    await send_log(context, update.effective_chat.id, f"<b>🟢 Завершена задача #{task_id}</b>\nСрок: {deadline_status}\nПравки: {'более 3' if qflag else 'до 3'}\nЗакрыл: {actor}")
 
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -731,8 +1082,10 @@ async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Активных задач нет.")
         return
     lines = ["<b>📋 АКТИВНЫЕ ЗАДАЧИ</b>", "━━━━━━━━━━━━━━"]
+    current_msk = now_msk()
     for r in rows:
-        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}\nСтатус: {r['status']}\nИсполнитель: {r['accepted_by'] or '—'}")
+        deadline_note = "\nСрок: просрочен" if parse_iso_msk(r["deadline"]) < current_msk else ""
+        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}{deadline_note}\nСтатус: {r['status']}\nИсполнитель: {r['accepted_by'] or '—'}")
     await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -744,8 +1097,10 @@ async def mytasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ У тебя нет активных задач.")
         return
     lines = ["<b>👤 МОИ ЗАДАЧИ</b>", "━━━━━━━━━━━━━━"]
+    current_msk = now_msk()
     for r in rows:
-        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}\nСтатус: {r['status']}")
+        deadline_note = "\nСрок: просрочен" if parse_iso_msk(r["deadline"]) < current_msk else ""
+        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}{deadline_note}\nСтатус: {r['status']}")
     await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -773,7 +1128,7 @@ async def taskinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Завершена: {fmt_dt(r['completed_at'])}
 Закрыл: {r['completed_by'] or '—'}
 Статус: {r['status']}
-В срок: {'да' if r['on_time'] == 1 else 'нет' if r['on_time'] == 0 else '—'}
+Срок: {'в срок' if r['on_time'] == 1 else 'просрочен' if r['on_time'] == 0 else '—'}
 Качество: {r['quality_flag'] if r['quality_flag'] is not None else '—'}
 Доработок: {r['rework_count']}
 """.strip()
@@ -1072,6 +1427,7 @@ async def setlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Напишите /setlog внутри нужной темы Telegram-группы.")
         return
     set_setting(f"log_topic:{update.effective_chat.id}", str(thread_id))
+    set_setting("log_chat_id", str(update.effective_chat.id))
     await update.message.reply_text("✅ Эта тема назначена логом задач.")
 
 
@@ -1106,6 +1462,57 @@ async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("UPDATE tasks SET on_time=? WHERE id=?", (on_time, task_id))
     log_action(task_id, "fixdeadline", user_name(update), f"late={late}")
     await update.message.reply_text(f"✅ Просрочка задачи #{task_id} исправлена. Просрочено: {'да' if late else 'нет'}.")
+
+
+async def deadline_alert_job(context: ContextTypes.DEFAULT_TYPE):
+    log_chat_id = get_log_chat_id()
+    if not log_chat_id:
+        return
+    current_msk = now_msk()
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT t.*
+            FROM tasks t
+            LEFT JOIN deadline_alerts a ON a.task_id = t.id
+            WHERE t.status != ? AND t.deadline < ? AND a.task_id IS NULL
+            ORDER BY t.deadline ASC
+            LIMIT 20
+            """,
+            (STATUSES["done"], current_msk.isoformat(timespec="seconds")),
+        ).fetchall()
+    if not rows:
+        return
+
+    topic = get_setting(f"log_topic:{log_chat_id}")
+    for r in rows:
+        notified_user = r["accepted_by"] or r["created_by"]
+        responsible_line = f"Отметка: {html.escape(notified_user)}"
+        if not r["accepted_by"]:
+            responsible_line = f"Исполнитель не назначен.\nОтметка постановщика: {html.escape(notified_user)}"
+        text = (
+            f"<b>⛔ Срок нарушен по задаче #{r['id']}</b>\n\n"
+            f"<b>{html.escape(r['title'])}</b>\n"
+            f"Дедлайн: {fmt_dt(r['deadline'])}\n"
+            f"Текущее время по Москве: {current_msk.strftime(DATETIME_FMT)}\n"
+            f"Статус: {html.escape(r['status'])}\n"
+            f"{responsible_line}"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=log_chat_id,
+                message_thread_id=int(topic) if topic else None,
+                text=text,
+                parse_mode=ParseMode.HTML,
+            )
+            with db() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO deadline_alerts(task_id,alerted_at,notified_user) VALUES(?,?,?)",
+                    (r["id"], now_iso(), notified_user),
+                )
+            log_action(r["id"], "deadline_overdue", notified_user, "deadline breached", r["status"], r["status"])
+        except Exception as e:
+            logger.warning("Deadline alert failed for task %s: %s", r["id"], e)
 
 
 async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1152,10 +1559,10 @@ def main() -> None:
     app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     handlers = [
-        ("start", start), ("help", help_cmd), ("adminhelp", adminhelp_cmd),
+        ("start", start), ("help", help_cmd), ("adminhelp", adminhelp_cmd), ("time", time_cmd),
         ("task", task_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
         ("tasks", tasks_cmd), ("mytasks", mytasks_cmd), ("taskinfo", taskinfo_cmd),
-        ("me", me_cmd), ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd),
+        ("me", me_cmd), ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd), ("history", history_cmd),
         ("adddesigner", adddesigner_cmd), ("removedesigner", removedesigner_cmd), ("designers", designers_cmd),
         ("setshiftstart", setshiftstart_cmd), ("online", online_cmd), ("week", week_cmd), ("swap", swap_cmd), ("clearswap", clearswap_cmd),
         ("setlog", setlog_cmd), ("setreports", setreports_cmd),
@@ -1163,9 +1570,14 @@ def main() -> None:
     ]
     for name, fn in handlers:
         app.add_handler(logged_command_handler(name, fn))
+    if MessageReactionHandler:
+        app.add_handler(MessageReactionHandler(reaction_accept_cmd))
+    else:
+        logger.warning("MessageReactionHandler is unavailable. Update python-telegram-bot to use task acceptance by reactions.")
     if not app.job_queue:
         raise RuntimeError("JobQueue не найден. Установите python-telegram-bot с поддержкой job-queue.")
     app.job_queue.scheduler.configure(timezone=MSK)
+    app.job_queue.run_repeating(deadline_alert_job, interval=60 * 15, first=30)
     app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
