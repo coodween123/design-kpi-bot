@@ -1,921 +1,896 @@
-
 import os
 import sqlite3
-from datetime import datetime
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+import logging
+from datetime import datetime, date, timedelta
+from collections import Counter, defaultdict
+from typing import Optional, Tuple, List
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-DB_NAME = os.getenv("DB_NAME", "design_kpi_bot.db")
+from telegram import Update, BotCommand
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+DB_PATH = os.getenv("DB_PATH", "design_kpi_bot.sqlite3")
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATE_FMT = "%d.%m.%Y"
+DATETIME_FMT = "%d.%m.%Y %H:%M"
+STATUSES = {
+    "waiting": "ожидает принятия",
+    "in_progress": "в работе",
+    "rework": "на доработке",
+    "done": "завершена",
+}
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logger = logging.getLogger(__name__)
 
 
-def now_dt() -> datetime:
-    return datetime.now()
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def now_text() -> str:
-    return now_dt().strftime("%d.%m.%Y %H:%M")
+def parse_dt(value: str) -> datetime:
+    return datetime.strptime(value.strip(), DATETIME_FMT)
 
 
-def month_text(dt: datetime | None = None) -> str:
-    return (dt or now_dt()).strftime("%m.%Y")
+def parse_date(value: str) -> date:
+    return datetime.strptime(value.strip(), DATE_FMT).date()
 
 
-def connect():
-    return sqlite3.connect(DB_NAME)
+def month_key(dt: datetime | date) -> str:
+    return dt.strftime("%m.%Y")
+
+
+def current_month() -> str:
+    return datetime.now().strftime("%m.%Y")
+
+
+def previous_month() -> str:
+    first = date.today().replace(day=1)
+    prev = first - timedelta(days=1)
+    return prev.strftime("%m.%Y")
+
+
+def fmt_dt(iso: Optional[str]) -> str:
+    if not iso:
+        return "—"
+    return datetime.fromisoformat(iso).strftime(DATETIME_FMT)
+
+
+def fmt_date(d: date) -> str:
+    return d.strftime(DATE_FMT)
+
+
+def user_name(update: Update) -> str:
+    u = update.effective_user
+    if not u:
+        return "unknown"
+    return f"@{u.username}" if u.username else f"id:{u.id}"
+
+
+def html_quote_code(text: str) -> str:
+    # Telegram blockquote + inline code. Works with HTML parse mode.
+    import html
+    return f"<blockquote><code>{html.escape(text)}</code></blockquote>"
+
+
+def pct(part: int, total: int) -> str:
+    return "0%" if total == 0 else f"{part / total * 100:.2f}%"
+
+
+def human_duration(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    return f"{h} ч. {m:02d} мин."
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db() -> None:
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
+    with db() as conn:
+        conn.executescript("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
-            value TEXT NOT NULL
-        )
-    """)
+            value TEXT
+        );
 
-    cur.execute("""
+        CREATE TABLE IF NOT EXISTS designers (
+            username TEXT PRIMARY KEY,
+            added_at TEXT NOT NULL,
+            active INTEGER NOT NULL DEFAULT 1
+        );
+
         CREATE TABLE IF NOT EXISTS tasks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT NOT NULL,
-            description TEXT NOT NULL,
+            description TEXT,
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL,
             deadline TEXT NOT NULL,
             accepted_by TEXT,
             accepted_at TEXT,
+            completed_by TEXT,
             completed_at TEXT,
             status TEXT NOT NULL,
-            revisions INTEGER DEFAULT 0,
-            on_time INTEGER DEFAULT 0,
-            points INTEGER DEFAULT 0,
-            month TEXT NOT NULL
-        )
-    """)
+            quality_flag INTEGER,
+            on_time INTEGER,
+            created_month TEXT NOT NULL,
+            completed_month TEXT,
+            rework_count INTEGER NOT NULL DEFAULT 0
+        );
 
-    cur.execute("""
         CREATE TABLE IF NOT EXISTS task_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
             task_id INTEGER,
             action TEXT NOT NULL,
-            user TEXT NOT NULL,
+            user TEXT,
             comment TEXT,
             old_status TEXT,
             new_status TEXT
-        )
-    """)
+        );
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scores (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
-            user TEXT NOT NULL,
-            points INTEGER NOT NULL,
+        CREATE TABLE IF NOT EXISTS shift_overrides (
+            date TEXT PRIMARY KEY,
+            designer TEXT NOT NULL,
             reason TEXT,
-            month TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS monthly_reports (
+            month TEXT PRIMARY KEY,
+            sent_at TEXT NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+        CREATE INDEX IF NOT EXISTS idx_tasks_completed_month ON tasks(completed_month);
+        CREATE INDEX IF NOT EXISTS idx_tasks_created_month ON tasks(created_month);
+        CREATE INDEX IF NOT EXISTS idx_tasks_accepted_by ON tasks(accepted_by);
+        """)
+
+
+def set_setting(key: str, value: str) -> None:
+    with db() as conn:
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+def get_setting(key: str) -> Optional[str]:
+    with db() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+
+def log_action(task_id: Optional[int], action: str, user: str, comment: str = "", old_status: str = "", new_status: str = "") -> None:
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO task_log(created_at,task_id,action,user,comment,old_status,new_status) VALUES(?,?,?,?,?,?,?)",
+            (now_iso(), task_id, action, user, comment, old_status, new_status),
         )
-    """)
-
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS kpi_archive (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            month TEXT NOT NULL,
-            total_tasks INTEGER NOT NULL,
-            on_time_tasks INTEGER NOT NULL,
-            on_time_percent REAL NOT NULL,
-            bad_tasks INTEGER NOT NULL,
-            bad_percent REAL NOT NULL,
-            total_points INTEGER NOT NULL,
-            kpi_deadline INTEGER NOT NULL,
-            kpi_quality INTEGER NOT NULL,
-            total_kpi INTEGER NOT NULL,
-            saved_at TEXT NOT NULL
-        )
-    """)
-
-    conn.commit()
-    conn.close()
 
 
-def get_user_name(update: Update) -> str:
-    user = update.effective_user
-    if not user:
-        return "unknown"
-    if user.username:
-        return f"@{user.username}"
-    return user.full_name
-
-
-def get_thread_id(update: Update) -> int | None:
-    message = update.effective_message
-    if not message:
-        return None
-    return message.message_thread_id
-
-
-def set_setting(key: str, value: str | int) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO settings (key, value)
-        VALUES (?, ?)
-        ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    """, (key, str(value)))
-    conn.commit()
-    conn.close()
-
-
-def get_setting(key: str) -> str | None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
-    row = cur.fetchone()
-    conn.close()
-    return row[0] if row else None
-
-
-def add_task_log(
-    task_id: int | str | None,
-    action: str,
-    user: str,
-    comment: str = "",
-    old_status: str = "",
-    new_status: str = "",
-) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO task_log
-        (created_at, task_id, action, user, comment, old_status, new_status)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (now_text(), task_id, action, user, comment, old_status, new_status))
-    conn.commit()
-    conn.close()
-
-
-async def send_to_saved_thread(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    setting_key: str,
-    text: str,
-) -> None:
-    thread_id = get_setting(setting_key)
-    if not thread_id:
-        return
-
+async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    topic = get_setting(f"log_topic:{chat_id}")
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            message_thread_id=int(thread_id),
+            message_thread_id=int(topic) if topic else None,
             text=text,
+            parse_mode=ParseMode.HTML,
         )
-    except Exception as exc:
-        print(f"Не удалось отправить сообщение в тему {setting_key}: {exc}")
+    except Exception as e:
+        logger.warning("Cannot send log: %s", e)
 
 
-def parse_deadline(deadline: str) -> datetime:
-    return datetime.strptime(deadline.strip(), "%d.%m.%Y %H:%M")
+def task_by_id(task_id: int):
+    with db() as conn:
+        return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
 
 
-def calc_points(revisions: int, on_time: int) -> int:
-    if revisions <= 2:
-        points = 5
-    elif revisions <= 5:
-        points = 3
-    else:
-        points = 1
-
-    if not on_time:
-        points -= 2
-
-    return max(points, 0)
+def completed_rows(month: str, user: Optional[str] = None):
+    q = "SELECT * FROM tasks WHERE status='завершена' AND completed_month=?"
+    args = [month]
+    if user:
+        q += " AND accepted_by=?"
+        args.append(user)
+    with db() as conn:
+        return conn.execute(q, args).fetchall()
 
 
-def get_kpi_data(month: str) -> dict | None:
-    conn = connect()
-    cur = conn.cursor()
-
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM tasks
-        WHERE status = 'завершена' AND month = ?
-    """, (month,))
-    total_tasks = cur.fetchone()[0]
-
-    if total_tasks == 0:
-        conn.close()
-        return None
-
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM tasks
-        WHERE status = 'завершена' AND month = ? AND on_time = 1
-    """, (month,))
-    on_time_tasks = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COUNT(*)
-        FROM tasks
-        WHERE status = 'завершена' AND month = ? AND revisions >= 6
-    """, (month,))
-    bad_tasks = cur.fetchone()[0]
-
-    cur.execute("""
-        SELECT COALESCE(SUM(points), 0)
-        FROM scores
-        WHERE month = ?
-    """, (month,))
-    total_points = cur.fetchone()[0]
-
-    conn.close()
-
-    on_time_percent = round(on_time_tasks / total_tasks * 100, 2)
-    bad_percent = round(bad_tasks / total_tasks * 100, 2)
-
-    if on_time_percent >= 99:
-        kpi_deadline = 10000
-    elif on_time_percent >= 90:
-        kpi_deadline = 7000
-    else:
-        kpi_deadline = 0
-
-    if bad_percent <= 3:
-        kpi_quality = 5000
-    elif bad_percent <= 10:
-        kpi_quality = 2500
-    else:
-        kpi_quality = 0
-
-    return {
-        "month": month,
-        "total_tasks": total_tasks,
-        "on_time_tasks": on_time_tasks,
-        "on_time_percent": on_time_percent,
-        "bad_tasks": bad_tasks,
-        "bad_percent": bad_percent,
-        "total_points": total_points,
-        "kpi_deadline": kpi_deadline,
-        "kpi_quality": kpi_quality,
-        "total_kpi": kpi_deadline + kpi_quality,
-    }
+def avg_completion(rows) -> Optional[float]:
+    durations = []
+    for r in rows:
+        if not r["completed_at"]:
+            continue
+        start = r["accepted_at"] or r["created_at"]
+        durations.append((datetime.fromisoformat(r["completed_at"]) - datetime.fromisoformat(start)).total_seconds())
+    return sum(durations) / len(durations) if durations else None
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await help_cmd(update, context)
 
 
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = """
-📌 Команды KPI-бота
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = f"""
+<b>🎨 DESIGN KPI BOT</b>
 
-Настройка:
-/setlog — назначить текущую тему логом задач
-/setreports — назначить текущую тему для KPI-отчётов
+Система учёта задач, KPI-статистики и графика работы дизайнеров.
 
-Задачи:
-/task Название | Дедлайн | Описание
-Создать задачу.
+━━━━━━━━━━━━━━
 
+<b>🚀 Основные команды</b>
+
+Создать задачу:
+{html_quote_code('/task Название | Дедлайн | Описание')}
 Пример:
-/task Баннер VK | 25.07.2026 18:00 | Сделать баннер 1080x1080
+{html_quote_code('/task Баннер VK | 31.07.2026 18:00 | Сделать баннер для рекламы курса')}
 
-/ok ID
-Принять задачу в работу.
-
+Взять задачу:
+{html_quote_code('/ok ID')}
 Пример:
-/ok 1
+{html_quote_code('/ok 15')}
 
-/done ID Правки
-Завершить задачу.
-
+Завершить задачу:
+{html_quote_code('/done ID 0/1')}
+<code>0</code> — до 3 правок
+<code>1</code> — более 3 правок
 Пример:
-/done 1 2
+{html_quote_code('/done 15 0')}
 
-/rework ID Причина
-Отправить задачу на доработку.
-
+Переназначить исполнителя:
+{html_quote_code('/reassign ID @username')}
 Пример:
-/rework 1 Неверный размер баннера
+{html_quote_code('/reassign 15 @anna')}
 
-/tasks
-Показать активные задачи.
+Отправить на доработку:
+{html_quote_code('/rework ID Причина')}
 
-/taskinfo ID
-Показать карточку задачи.
+Активные задачи:
+{html_quote_code('/tasks')}
 
-Баллы:
-/score @user +5 Причина
-Начислить или списать баллы вручную.
+Мои задачи:
+{html_quote_code('/mytasks')}
 
-Пример:
-/score @george +5 Срочная задача
+Карточка задачи:
+{html_quote_code('/taskinfo ID')}
 
-/myscore
-Мои баллы за текущий месяц.
+━━━━━━━━━━━━━━
 
-KPI:
-/stats
-Статистика за текущий месяц.
+<b>👤 Личная статистика</b>
 
-/stats 07.2026
-Статистика за конкретный месяц.
+{html_quote_code('/me')}
+{html_quote_code('/me 07.2026')}
 
-/kpi
-KPI за текущий месяц.
+━━━━━━━━━━━━━━
 
-/kpi 07.2026
-KPI за конкретный месяц.
+<b>📊 Статистика команды</b>
 
-/savekpi
-Сохранить KPI текущего месяца в архив.
+{html_quote_code('/stats')}
+{html_quote_code('/report')}
+{html_quote_code('/top')}
 
-/savekpi 07.2026
-Сохранить KPI выбранного месяца в архив.
+━━━━━━━━━━━━━━
 
-/kpi_history
-Показать историю сохранённых KPI.
+<b>📅 График работы</b>
 
-Система баллов:
-0–2 правки = +5
-3–5 правок = +3
-6+ правок = +1
-Просрочка = -2
-"""
-    await update.effective_message.reply_text(text)
+Кто сегодня работает:
+{html_quote_code('/online')}
+
+Кто работает в дату:
+{html_quote_code('/online 05.08.2026')}
+
+График на 7 дней:
+{html_quote_code('/week')}
+
+━━━━━━━━━━━━━━
+
+<b>🔧 Админ-команды</b>
+
+Полный список:
+{html_quote_code('/adminhelp')}
+""".strip()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def setlog(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    thread_id = get_thread_id(update)
-    if thread_id is None:
-        await update.effective_message.reply_text("❌ Команду /setlog нужно писать в теме Telegram-группы.")
+async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = f"""
+<b>🔧 АДМИН-КОМАНДЫ</b>
+
+Технические команды для настройки бота.
+
+━━━━━━━━━━━━━━
+
+<b>👨‍🎨 Дизайнеры</b>
+Добавить дизайнера:
+{html_quote_code('/adddesigner @username')}
+Удалить дизайнера из активных:
+{html_quote_code('/removedesigner @username')}
+Список дизайнеров:
+{html_quote_code('/designers')}
+
+━━━━━━━━━━━━━━
+
+<b>📅 График работы 2/2</b>
+Задать старт графика:
+{html_quote_code('/setshiftstart 01.08.2026 @george')}
+Назначить подмену:
+{html_quote_code('/swap 05.08.2026 @anna Подмена Георгия')}
+Убрать подмену:
+{html_quote_code('/clearswap 05.08.2026')}
+
+━━━━━━━━━━━━━━
+
+<b>📋 Настройка тем</b>
+Назначить текущую тему логом задач:
+{html_quote_code('/setlog')}
+Назначить текущую тему для отчётов:
+{html_quote_code('/setreports')}
+
+━━━━━━━━━━━━━━
+
+<b>🛠 Исправление ошибок</b>
+Исправить качество:
+{html_quote_code('/fixquality ID 0/1')}
+Исправить просрочку:
+{html_quote_code('/fixdeadline ID 0/1')}
+""".strip()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def setup_commands(app: Application):
+    await app.bot.set_my_commands([
+        BotCommand("help", "основная справка"),
+        BotCommand("task", "создать задачу"),
+        BotCommand("tasks", "активные задачи"),
+        BotCommand("mytasks", "мои задачи"),
+        BotCommand("me", "моя статистика"),
+        BotCommand("stats", "статистика команды"),
+        BotCommand("report", "месячный отчёт"),
+        BotCommand("top", "рейтинг"),
+        BotCommand("online", "кто сегодня работает"),
+        BotCommand("week", "график на 7 дней"),
+        BotCommand("adminhelp", "технические команды"),
+    ])
+
+
+async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.partition(" ")[2]
+    parts = [p.strip() for p in raw.split("|", 2)]
+    if len(parts) != 3:
+        await update.message.reply_text("❌ Формат: /task Название | 31.07.2026 18:00 | Описание")
         return
-
-    set_setting("log_thread_id", thread_id)
-    await update.effective_message.reply_text("✅ Эта тема назначена логом задач.")
-
-
-async def setreports(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    thread_id = get_thread_id(update)
-    if thread_id is None:
-        await update.effective_message.reply_text("❌ Команду /setreports нужно писать в теме Telegram-группы.")
-        return
-
-    set_setting("reports_thread_id", thread_id)
-    await update.effective_message.reply_text("✅ Эта тема назначена темой KPI-отчётов.")
-
-
-async def task(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message_text = update.effective_message.text or ""
-    raw = message_text.replace("/task", "", 1).strip()
-    parts = [part.strip() for part in raw.split("|")]
-
-    if len(parts) < 3:
-        await update.effective_message.reply_text(
-            "❌ Неверный формат.\n\n"
-            "Используй:\n/task Название | Дедлайн | Описание\n\n"
-            "Пример:\n/task Баннер VK | 25.07.2026 18:00 | Сделать баннер"
-        )
-        return
-
-    title = parts[0]
-    deadline = parts[1]
-    description = "|".join(parts[2:]).strip()
-
+    title, deadline_s, desc = parts
     try:
-        parse_deadline(deadline)
+        deadline = parse_dt(deadline_s)
     except ValueError:
-        await update.effective_message.reply_text(
-            "❌ Дедлайн должен быть в формате:\n25.07.2026 18:00"
+        await update.message.reply_text("❌ Дедлайн нужен в формате: 31.07.2026 18:00")
+        return
+    creator = user_name(update)
+    created_at = now_iso()
+    with db() as conn:
+        cur = conn.execute(
+            """INSERT INTO tasks(title,description,created_by,created_at,deadline,status,created_month)
+               VALUES(?,?,?,?,?,?,?)""",
+            (title, desc, creator, created_at, deadline.isoformat(timespec="seconds"), STATUSES["waiting"], month_key(datetime.fromisoformat(created_at))),
         )
+        task_id = cur.lastrowid
+    log_action(task_id, "create", creator, title, "", STATUSES["waiting"])
+    await update.message.reply_text(f"✅ Задача #{task_id} создана. Статус: ожидает принятия.")
+    await send_log(context, update.effective_chat.id, f"<b>✅ Создана задача #{task_id}</b>\n\n<b>{title}</b>\nДедлайн: {deadline.strftime(DATETIME_FMT)}\nАвтор: {creator}\n\n{desc}")
+
+
+async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Формат: /ok ID")
         return
-
-    user = get_user_name(update)
-    created_at = now_text()
-    month = month_text()
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO tasks
-        (title, description, created_by, created_at, deadline, status, month)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, (title, description, user, created_at, deadline, "ожидает принятия", month))
-    task_id = cur.lastrowid
-    conn.commit()
-    conn.close()
-
-    add_task_log(task_id, "создана", user, title, "", "ожидает принятия")
-
-    await update.effective_message.reply_text(
-        f"✅ Задача #{task_id} создана.\nСтатус: ожидает принятия."
-    )
-
-    log_text = (
-        f"🆕 Задача #{task_id} поступила\n\n"
-        f"Название: {title}\n"
-        f"Автор: {user}\n"
-        f"Создана: {created_at}\n"
-        f"Дедлайн: {deadline}\n"
-        f"Статус: ожидает принятия\n\n"
-        f"Описание:\n{description}"
-    )
-
-    await send_to_saved_thread(context, update.effective_chat.id, "log_thread_id", log_text)
-
-
-async def ok(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.effective_message.reply_text("❌ Формат:\n/ok ID\n\nПример:\n/ok 1")
-        return
-
-    task_id = context.args[0]
-    user = get_user_name(update)
-    accepted_at = now_text()
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
-    row = cur.fetchone()
-
+    task_id = int(context.args[0])
+    row = task_by_id(task_id)
     if not row:
-        conn.close()
-        await update.effective_message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("❌ Задача не найдена.")
         return
-
-    old_status = row[0]
-
-    if old_status == "завершена":
-        conn.close()
-        await update.effective_message.reply_text("❌ Нельзя принять завершённую задачу.")
+    if row["accepted_by"] and row["status"] != STATUSES["waiting"]:
+        await update.message.reply_text(f"❌ Задача уже назначена на {row['accepted_by']}.\nИспользуйте /reassign для переназначения.")
         return
-
-    cur.execute("""
-        UPDATE tasks
-        SET status = 'в работе',
-            accepted_by = ?,
-            accepted_at = ?
-        WHERE id = ?
-    """, (user, accepted_at, task_id))
-    conn.commit()
-    conn.close()
-
-    add_task_log(task_id, "принята", user, "", old_status, "в работе")
-
-    await update.effective_message.reply_text(
-        f"🔵 Задача #{task_id} принята в работу.\nИсполнитель: {user}"
-    )
-
-    await send_to_saved_thread(
-        context,
-        update.effective_chat.id,
-        "log_thread_id",
-        f"🔵 Задача #{task_id} принята\n\nИсполнитель: {user}\nДата: {accepted_at}",
-    )
+    executor = user_name(update)
+    with db() as conn:
+        conn.execute("UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?", (executor, now_iso(), STATUSES["in_progress"], task_id))
+    log_action(task_id, "accept", executor, "", row["status"], STATUSES["in_progress"])
+    await update.message.reply_text(f"🔵 Задача #{task_id} принята в работу. Исполнитель: {executor}")
+    await send_log(context, update.effective_chat.id, f"<b>🔵 Задача #{task_id} принята</b>\nИсполнитель: {executor}")
 
 
-async def done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Формат: /reassign ID @username")
+        return
+    task_id = int(context.args[0])
+    new_user = context.args[1]
+    row = task_by_id(task_id)
+    if not row:
+        await update.message.reply_text("❌ Задача не найдена.")
+        return
+    if row["status"] == STATUSES["done"]:
+        await update.message.reply_text("❌ Завершённую задачу нельзя переназначить.")
+        return
+    old = row["accepted_by"] or "—"
+    with db() as conn:
+        conn.execute("UPDATE tasks SET accepted_by=?, accepted_at=COALESCE(accepted_at, ?) WHERE id=?", (new_user, now_iso(), task_id))
+    actor = user_name(update)
+    log_action(task_id, "reassign", actor, f"{old} -> {new_user}", row["status"], row["status"])
+    msg = f"🔄 Задача #{task_id} переназначена.\n\nСтарый исполнитель: {old}\nНовый исполнитель: {new_user}"
+    await update.message.reply_text(msg)
+    await send_log(context, update.effective_chat.id, f"<b>🔄 Переназначение задачи #{task_id}</b>\nСтарый: {old}\nНовый: {new_user}\nКто изменил: {actor}")
+
+
+async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
+        await update.message.reply_text("❌ Формат: /done ID 0/1")
+        return
+    task_id = int(context.args[0])
+    qflag = int(context.args[1])
+    row = task_by_id(task_id)
+    if not row:
+        await update.message.reply_text("❌ Задача не найдена.")
+        return
+    completed_at = datetime.now()
+    deadline = datetime.fromisoformat(row["deadline"])
+    on_time = 1 if completed_at <= deadline else 0
+    actor = user_name(update)
+    with db() as conn:
+        conn.execute(
+            """UPDATE tasks SET completed_by=?, completed_at=?, status=?, quality_flag=?, on_time=?, completed_month=? WHERE id=?""",
+            (actor, completed_at.isoformat(timespec="seconds"), STATUSES["done"], qflag, on_time, month_key(completed_at), task_id),
+        )
+    log_action(task_id, "done", actor, f"quality={qflag}; on_time={on_time}", row["status"], STATUSES["done"])
+    await update.message.reply_text(f"🟢 Задача #{task_id} завершена. В срок: {'да' if on_time else 'нет'}. Правки: {'более 3' if qflag else 'до 3'}.")
+    await send_log(context, update.effective_chat.id, f"<b>🟢 Завершена задача #{task_id}</b>\nВ срок: {'да' if on_time else 'нет'}\nПравки: {'более 3' if qflag else 'до 3'}\nЗакрыл: {actor}")
+
+
+async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Формат: /rework ID Причина")
+        return
+    task_id = int(context.args[0])
+    reason = " ".join(context.args[1:])
+    row = task_by_id(task_id)
+    if not row:
+        await update.message.reply_text("❌ Задача не найдена.")
+        return
+    with db() as conn:
+        conn.execute("UPDATE tasks SET status=?, rework_count=rework_count+1 WHERE id=?", (STATUSES["rework"], task_id))
+    actor = user_name(update)
+    log_action(task_id, "rework", actor, reason, row["status"], STATUSES["rework"])
+    await update.message.reply_text(f"🟠 Задача #{task_id} отправлена на доработку.\nПричина: {reason}")
+    await send_log(context, update.effective_chat.id, f"<b>🟠 Доработка задачи #{task_id}</b>\nПричина: {reason}\nКто отправил: {actor}")
+
+
+async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM tasks WHERE status!='завершена' ORDER BY deadline ASC").fetchall()
+    if not rows:
+        await update.message.reply_text("✅ Активных задач нет.")
+        return
+    lines = ["<b>📋 АКТИВНЫЕ ЗАДАЧИ</b>", "━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}\nСтатус: {r['status']}\nИсполнитель: {r['accepted_by'] or '—'}")
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def mytasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    me = user_name(update)
+    with db() as conn:
+        rows = conn.execute("SELECT * FROM tasks WHERE status!='завершена' AND accepted_by=? ORDER BY deadline ASC", (me,)).fetchall()
+    if not rows:
+        await update.message.reply_text("✅ У тебя нет активных задач.")
+        return
+    lines = ["<b>👤 МОИ ЗАДАЧИ</b>", "━━━━━━━━━━━━━━"]
+    for r in rows:
+        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}\nСтатус: {r['status']}")
+    await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def taskinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text("❌ Формат: /taskinfo ID")
+        return
+    r = task_by_id(int(context.args[0]))
+    if not r:
+        await update.message.reply_text("❌ Задача не найдена.")
+        return
+    text = f"""
+<b>📌 ЗАДАЧА #{r['id']}</b>
+
+<b>{r['title']}</b>
+{r['description'] or '—'}
+
+━━━━━━━━━━━━━━
+
+Автор: {r['created_by']}
+Создана: {fmt_dt(r['created_at'])}
+Исполнитель: {r['accepted_by'] or '—'}
+Принята: {fmt_dt(r['accepted_at'])}
+Дедлайн: {fmt_dt(r['deadline'])}
+Завершена: {fmt_dt(r['completed_at'])}
+Закрыл: {r['completed_by'] or '—'}
+Статус: {r['status']}
+В срок: {'да' if r['on_time'] == 1 else 'нет' if r['on_time'] == 0 else '—'}
+Качество: {r['quality_flag'] if r['quality_flag'] is not None else '—'}
+Доработок: {r['rework_count']}
+""".strip()
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+def stats_text(month: str, personal_user: Optional[str] = None) -> str:
+    rows = completed_rows(month, personal_user)
+    total_done = len(rows)
+    ontime = sum(1 for r in rows if r["on_time"] == 1)
+    late = sum(1 for r in rows if r["on_time"] == 0)
+    quality_bad = sum(1 for r in rows if r["quality_flag"] == 1)
+    quality_good = total_done - quality_bad
+    avg = human_duration(avg_completion(rows))
+    if personal_user:
+        return f"""
+<b>👤 МОЯ СТАТИСТИКА — {month}</b>
+
+━━━━━━━━━━━━━━
+
+<b>📌 Задачи</b>
+Выполнено задач: {total_done}
+
+━━━━━━━━━━━━━━
+
+<b>⏱ Сроки</b>
+В срок: {ontime}
+Просрочено: {late}
+Процент просрочек: {pct(late, total_done)}
+
+━━━━━━━━━━━━━━
+
+<b>🎯 Качество</b>
+До 3 правок: {quality_good}
+Более 3 правок: {quality_bad}
+Процент задач с правками: {pct(quality_bad, total_done)}
+
+━━━━━━━━━━━━━━
+
+<b>⚡ Среднее время выполнения</b>
+{avg}
+""".strip()
+    with db() as conn:
+        created = conn.execute("SELECT COUNT(*) c FROM tasks WHERE created_month=?", (month,)).fetchone()["c"]
+        active = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status!='завершена'").fetchone()["c"]
+        in_work = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status='в работе'").fetchone()["c"]
+        rework = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status='на доработке'").fetchone()["c"]
+    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(3)
+    creator_top = Counter()
+    with db() as conn:
+        for r in conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall():
+            creator_top[r["created_by"]] += 1
+    def top_lines(items):
+        medals = ["🥇", "🥈", "🥉"]
+        return "\n".join(f"{medals[i]} {name} — {count}" for i, (name, count) in enumerate(items)) or "—"
+    return f"""
+<b>📊 СТАТИСТИКА — {month}</b>
+
+━━━━━━━━━━━━━━
+
+<b>📌 Задачи</b>
+Создано задач: {created}
+Завершено задач: {total_done}
+Активных задач: {active}
+В работе: {in_work}
+На доработке: {rework}
+
+━━━━━━━━━━━━━━
+
+<b>⏱ Сроки</b>
+В срок: {ontime}
+Просрочено: {late}
+Процент просрочек: {pct(late, total_done)}
+
+━━━━━━━━━━━━━━
+
+<b>🎯 Качество</b>
+До 3 правок: {quality_good}
+Более 3 правок: {quality_bad}
+Процент задач с правками: {pct(quality_bad, total_done)}
+
+━━━━━━━━━━━━━━
+
+<b>⚡ Эффективность</b>
+Среднее время выполнения: {avg}
+
+━━━━━━━━━━━━━━
+
+<b>🏆 Топ исполнителей</b>
+{top_lines(exec_top)}
+
+━━━━━━━━━━━━━━
+
+<b>📨 Кто ставит больше задач</b>
+{top_lines(creator_top.most_common(3))}
+""".strip()
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month = context.args[0] if context.args else current_month()
+    await update.message.reply_text(stats_text(month), parse_mode=ParseMode.HTML)
+
+
+async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month = context.args[0] if context.args else current_month()
+    await update.message.reply_text(stats_text(month, user_name(update)), parse_mode=ParseMode.HTML)
+
+
+def report_text(month: str) -> str:
+    base = stats_text(month)
+    rows = completed_rows(month)
+    per = defaultdict(list)
+    for r in rows:
+        per[r["accepted_by"] or "—"].append(r)
+    performers = sorted(per.items(), key=lambda x: len(x[1]), reverse=True)
+    details = []
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (name, rs) in enumerate(performers[:10]):
+        details.append(f"{medals[i] if i < 3 else '•'} {name} — {len(rs)} задач\n• В срок: {sum(1 for r in rs if r['on_time']==1)}\n• Просрочек: {sum(1 for r in rs if r['on_time']==0)}\n• С правками более 3: {sum(1 for r in rs if r['quality_flag']==1)}\n• Среднее время: {human_duration(avg_completion(rs))}")
+    best = performers[0][0] if performers else "—"
+    best_count = len(performers[0][1]) if performers else 0
+    return base.replace("<b>📊 СТАТИСТИКА", "<b>📈 ОТЧЁТ") + f"\n\n━━━━━━━━━━━━━━\n\n<b>👨‍🎨 Исполнители</b>\n" + ("\n\n".join(details) or "—") + f"\n\n━━━━━━━━━━━━━━\n\n<b>🏆 Лучший исполнитель месяца</b>\n{best} — {best_count} выполненных задач."
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month = context.args[0] if context.args else current_month()
+    await update.message.reply_text(report_text(month), parse_mode=ParseMode.HTML)
+
+
+async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    month = context.args[0] if context.args else current_month()
+    rows = completed_rows(month)
+    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(10)
+    with db() as conn:
+        creators = Counter(r["created_by"] for r in conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall())
+    medals = ["🥇", "🥈", "🥉"]
+    def lines(items):
+        return "\n".join(f"{medals[i] if i < 3 else '•'} {n} — {c}" for i, (n, c) in enumerate(items)) or "—"
+    text = f"<b>🏆 РЕЙТИНГ — {month}</b>\n\n━━━━━━━━━━━━━━\n\n<b>👨‍🎨 Исполнители</b>\n{lines(exec_top)}\n\n━━━━━━━━━━━━━━\n\n<b>📨 Постановщики</b>\n{lines(creators.most_common(10))}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def adddesigner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Формат: /adddesigner @username")
+        return
+    username = context.args[0]
+    with db() as conn:
+        conn.execute("INSERT INTO designers(username,added_at,active) VALUES(?,?,1) ON CONFLICT(username) DO UPDATE SET active=1", (username, now_iso()))
+    await update.message.reply_text(f"✅ Дизайнер {username} добавлен.")
+
+
+async def removedesigner_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Формат: /removedesigner @username")
+        return
+    with db() as conn:
+        conn.execute("UPDATE designers SET active=0 WHERE username=?", (context.args[0],))
+    await update.message.reply_text(f"✅ Дизайнер {context.args[0]} убран из активных.")
+
+
+async def designers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with db() as conn:
+        rows = conn.execute("SELECT username FROM designers WHERE active=1 ORDER BY username").fetchall()
+    await update.message.reply_text("<b>👨‍🎨 ДИЗАЙНЕРЫ</b>\n\n" + ("\n".join(r["username"] for r in rows) or "—"), parse_mode=ParseMode.HTML)
+
+
+def active_designers() -> List[str]:
+    with db() as conn:
+        return [r["username"] for r in conn.execute("SELECT username FROM designers WHERE active=1 ORDER BY username").fetchall()]
+
+
+def base_shift_for(d: date) -> Tuple[Optional[str], Optional[str]]:
+    designers = active_designers()
+    if len(designers) != 2:
+        return None, "Для графика 2/2 нужно добавить ровно двух активных дизайнеров."
+    start_s = get_setting("shift_start_date")
+    start_designer = get_setting("shift_start_designer")
+    if not start_s or not start_designer:
+        return None, "Старт графика не задан. Используйте /setshiftstart 01.08.2026 @designer"
+    if start_designer not in designers:
+        return None, "Стартовый дизайнер не найден среди активных дизайнеров."
+    other = designers[0] if designers[1] == start_designer else designers[1]
+    days = (d - parse_date(start_s)).days
+    block = (days // 2) % 2
+    return (start_designer if block == 0 else other), None
+
+
+def shift_for(d: date) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    with db() as conn:
+        over = conn.execute("SELECT * FROM shift_overrides WHERE date=?", (fmt_date(d),)).fetchone()
+    if over:
+        return over["designer"], "swap", over["reason"]
+    designer, err = base_shift_for(d)
+    return designer, None if not err else "error", err
+
+
+async def setshiftstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.effective_message.reply_text(
-            "❌ Формат:\n/done ID количество_правок\n\nПример:\n/done 1 2"
-        )
+        await update.message.reply_text("❌ Формат: /setshiftstart 01.08.2026 @designer")
         return
-
-    task_id = context.args[0]
-
     try:
-        revisions = int(context.args[1])
+        d = parse_date(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("❌ Количество правок должно быть числом.")
+        await update.message.reply_text("❌ Дата нужна в формате: 01.08.2026")
         return
-
-    if revisions < 0:
-        await update.effective_message.reply_text("❌ Количество правок не может быть меньше 0.")
+    designer = context.args[1]
+    if designer not in active_designers():
+        await update.message.reply_text("❌ Этот дизайнер не добавлен в активные. Используйте /adddesigner @username")
         return
+    set_setting("shift_start_date", fmt_date(d))
+    set_setting("shift_start_designer", designer)
+    await update.message.reply_text(f"✅ Старт графика 2/2 задан.\nДата: {fmt_date(d)}\nРаботает: {designer}")
 
-    user = get_user_name(update)
-    completed_at = now_text()
 
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT deadline, status, accepted_by
-        FROM tasks
-        WHERE id = ?
-    """, (task_id,))
-    row = cur.fetchone()
-
-    if not row:
-        conn.close()
-        await update.effective_message.reply_text("❌ Задача не найдена.")
-        return
-
-    deadline, old_status, accepted_by = row
-
-    if old_status == "завершена":
-        conn.close()
-        await update.effective_message.reply_text("❌ Эта задача уже завершена.")
-        return
-
+async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        on_time = 1 if now_dt() <= parse_deadline(deadline) else 0
+        d = parse_date(context.args[0]) if context.args else date.today()
     except ValueError:
-        on_time = 0
-
-    points = calc_points(revisions, on_time)
-    score_user = accepted_by or user
-    month = month_text()
-
-    cur.execute("""
-        UPDATE tasks
-        SET status = 'завершена',
-            completed_at = ?,
-            revisions = ?,
-            on_time = ?,
-            points = ?
-        WHERE id = ?
-    """, (completed_at, revisions, on_time, points, task_id))
-
-    cur.execute("""
-        INSERT INTO scores
-        (created_at, user, points, reason, month)
-        VALUES (?, ?, ?, ?, ?)
-    """, (
-        completed_at,
-        score_user,
-        points,
-        f"Задача #{task_id}, правок: {revisions}",
-        month,
-    ))
-
-    conn.commit()
-    conn.close()
-
-    add_task_log(
-        task_id,
-        "завершена",
-        user,
-        f"{revisions} правок, +{points} баллов",
-        old_status,
-        "завершена",
-    )
-
-    await update.effective_message.reply_text(
-        f"🟢 Задача #{task_id} завершена.\n"
-        f"Правок: {revisions}\n"
-        f"В срок: {'да' if on_time else 'нет'}\n"
-        f"Баллы: +{points}"
-    )
-
-    await send_to_saved_thread(
-        context,
-        update.effective_chat.id,
-        "log_thread_id",
-        f"🟢 Задача #{task_id} завершена\n\n"
-        f"Исполнитель: {score_user}\n"
-        f"Дата: {completed_at}\n"
-        f"Правок: {revisions}\n"
-        f"В срок: {'да' if on_time else 'нет'}\n"
-        f"Начислено баллов: +{points}",
-    )
+        await update.message.reply_text("❌ Дата нужна в формате: 05.08.2026")
+        return
+    designer, mode, reason = shift_for(d)
+    if mode == "error":
+        await update.message.reply_text(f"❌ {reason}")
+        return
+    next_d = d + timedelta(days=1)
+    for _ in range(10):
+        nd, nm, _ = shift_for(next_d)
+        if nm != "error" and nd != designer:
+            break
+        next_d += timedelta(days=1)
+    text = f"<b>👨‍🎨 Сегодня работает</b>\n\n{designer}\n\n📅 Дата: {fmt_date(d)}"
+    if mode == "swap":
+        text += f"\n\n<b>🔄 Подмена</b>\nПричина: {reason or '—'}"
+    text += f"\n\n➡️ Следующая смена:\n{nd}\nс {fmt_date(next_d)}"
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-async def rework(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    start = date.today()
+    lines = ["<b>📅 ГРАФИК НА 7 ДНЕЙ</b>", "━━━━━━━━━━━━━━"]
+    for i in range(7):
+        d = start + timedelta(days=i)
+        designer, mode, reason = shift_for(d)
+        if mode == "error":
+            await update.message.reply_text(f"❌ {reason}")
+            return
+        mark = " 🔄" if mode == "swap" else ""
+        lines.append(f"{d.strftime('%d.%m')} — {designer}{mark}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text("❌ Формат: /swap 05.08.2026 @anna Причина")
+        return
+    try:
+        d = parse_date(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Дата нужна в формате: 05.08.2026")
+        return
+    designer = context.args[1]
+    reason = " ".join(context.args[2:]) or "—"
+    old, mode, err = shift_for(d)
+    if mode == "error":
+        await update.message.reply_text(f"❌ {err}")
+        return
+    with db() as conn:
+        conn.execute("INSERT INTO shift_overrides(date,designer,reason,created_at,created_by) VALUES(?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET designer=excluded.designer, reason=excluded.reason, created_at=excluded.created_at, created_by=excluded.created_by", (fmt_date(d), designer, reason, now_iso(), user_name(update)))
+    await update.message.reply_text(f"🔄 Подмена назначена.\n\nДата: {fmt_date(d)}\nВместо: {old}\nРаботает: {designer}\nПричина: {reason}")
+    await send_log(context, update.effective_chat.id, f"<b>🔄 Назначена подмена</b>\nДата: {fmt_date(d)}\nВместо: {old}\nРаботает: {designer}\nПричина: {reason}")
+
+
+async def clearswap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.effective_message.reply_text(
-            "❌ Формат:\n/rework ID Причина\n\nПример:\n/rework 1 Неверный размер"
-        )
+        await update.message.reply_text("❌ Формат: /clearswap 05.08.2026")
         return
-
-    task_id = context.args[0]
-    reason = " ".join(context.args[1:]).strip() or "Причина не указана"
-    user = get_user_name(update)
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("SELECT status FROM tasks WHERE id = ?", (task_id,))
-    row = cur.fetchone()
-
-    if not row:
-        conn.close()
-        await update.effective_message.reply_text("❌ Задача не найдена.")
-        return
-
-    old_status = row[0]
-
-    if old_status == "завершена":
-        conn.close()
-        await update.effective_message.reply_text("❌ Нельзя отправить завершённую задачу на доработку.")
-        return
-
-    cur.execute("""
-        UPDATE tasks
-        SET status = 'на доработке'
-        WHERE id = ?
-    """, (task_id,))
-    conn.commit()
-    conn.close()
-
-    add_task_log(task_id, "доработка", user, reason, old_status, "на доработке")
-
-    await update.effective_message.reply_text(f"🟠 Задача #{task_id} отправлена на доработку.")
-
-    await send_to_saved_thread(
-        context,
-        update.effective_chat.id,
-        "log_thread_id",
-        f"🟠 Задача #{task_id} на доработке\n\n"
-        f"Кто отправил: {user}\n"
-        f"Причина:\n{reason}",
-    )
-
-
-async def tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT id, title, deadline, status, accepted_by
-        FROM tasks
-        WHERE status != 'завершена'
-        ORDER BY id DESC
-        LIMIT 30
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.effective_message.reply_text("📭 Активных задач нет.")
-        return
-
-    text = "📋 Активные задачи:\n\n"
-    for task_id, title, deadline, status, accepted_by in rows:
-        text += (
-            f"#{task_id} — {title}\n"
-            f"Дедлайн: {deadline}\n"
-            f"Статус: {status}\n"
-            f"Исполнитель: {accepted_by or 'не назначен'}\n\n"
-        )
-
-    await update.effective_message.reply_text(text)
-
-
-async def taskinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.args:
-        await update.effective_message.reply_text("❌ Формат:\n/taskinfo ID")
-        return
-
-    task_id = context.args[0]
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT title, description, created_by, created_at, deadline,
-               accepted_by, accepted_at, completed_at, status,
-               revisions, on_time, points
-        FROM tasks
-        WHERE id = ?
-    """, (task_id,))
-    row = cur.fetchone()
-    conn.close()
-
-    if not row:
-        await update.effective_message.reply_text("❌ Задача не найдена.")
-        return
-
-    (
-        title,
-        description,
-        created_by,
-        created_at,
-        deadline,
-        accepted_by,
-        accepted_at,
-        completed_at,
-        status,
-        revisions,
-        on_time,
-        points,
-    ) = row
-
-    text = (
-        f"📌 Задача #{task_id}\n\n"
-        f"Название: {title}\n"
-        f"Статус: {status}\n\n"
-        f"Автор: {created_by}\n"
-        f"Создана: {created_at}\n"
-        f"Исполнитель: {accepted_by or 'не назначен'}\n"
-        f"Принята: {accepted_at or '—'}\n\n"
-        f"Дедлайн: {deadline}\n"
-        f"Завершена: {completed_at or '—'}\n"
-        f"Правки: {revisions}\n"
-        f"В срок: {'да' if on_time else 'нет'}\n"
-        f"Баллы: {points}\n\n"
-        f"Описание:\n{description}"
-    )
-
-    await update.effective_message.reply_text(text)
-
-
-async def score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if len(context.args) < 3:
-        await update.effective_message.reply_text(
-            "❌ Формат:\n/score @user +5 Причина\n\nПример:\n/score @george +5 Срочная задача"
-        )
-        return
-
-    target_user = context.args[0]
-
     try:
-        points = int(context.args[1])
+        d = parse_date(context.args[0])
     except ValueError:
-        await update.effective_message.reply_text("❌ Баллы должны быть числом: +5 или -2.")
+        await update.message.reply_text("❌ Дата нужна в формате: 05.08.2026")
         return
-
-    reason = " ".join(context.args[2:]).strip()
-    created_at = now_text()
-    month = month_text()
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO scores
-        (created_at, user, points, reason, month)
-        VALUES (?, ?, ?, ?, ?)
-    """, (created_at, target_user, points, reason, month))
-    conn.commit()
-    conn.close()
-
-    await update.effective_message.reply_text(
-        f"✅ Баллы обновлены.\n"
-        f"{target_user}: {points:+}\n"
-        f"Причина: {reason}"
-    )
+    with db() as conn:
+        conn.execute("DELETE FROM shift_overrides WHERE date=?", (fmt_date(d),))
+    await update.message.reply_text(f"↩️ Подмена на {fmt_date(d)} отменена. Возвращён стандартный график.")
+    await send_log(context, update.effective_chat.id, f"<b>↩️ Подмена отменена</b>\nДата: {fmt_date(d)}\nВозвращён стандартный график.")
 
 
-async def myscore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = get_user_name(update)
-    month = month_text()
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COALESCE(SUM(points), 0)
-        FROM scores
-        WHERE user = ? AND month = ?
-    """, (user, month))
-    total = cur.fetchone()[0]
-    conn.close()
-
-    await update.effective_message.reply_text(f"🏅 {user}, твои баллы за {month}: {total}")
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    month = context.args[0] if context.args else month_text()
-    data = get_kpi_data(month)
-
-    if not data:
-        await update.effective_message.reply_text(f"📭 За {month} пока нет завершённых задач.")
+async def setlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    thread_id = update.message.message_thread_id
+    if not thread_id:
+        await update.message.reply_text("❌ Напишите /setlog внутри нужной темы Telegram-группы.")
         return
-
-    text = (
-        f"📊 Статистика за {month}\n\n"
-        f"Завершено задач: {data['total_tasks']}\n"
-        f"В срок: {data['on_time_tasks']}\n"
-        f"Процент в срок: {data['on_time_percent']}%\n\n"
-        f"Проблемных задач, 6+ правок: {data['bad_tasks']}\n"
-        f"Процент проблемных: {data['bad_percent']}%\n\n"
-        f"Баллы всего: {data['total_points']}"
-    )
-
-    await update.effective_message.reply_text(text)
+    set_setting(f"log_topic:{update.effective_chat.id}", str(thread_id))
+    await update.message.reply_text("✅ Эта тема назначена логом задач.")
 
 
-async def kpi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    month = context.args[0] if context.args else month_text()
-    data = get_kpi_data(month)
-
-    if not data:
-        await update.effective_message.reply_text(f"📭 За {month} пока нет данных для KPI.")
+async def setreports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    thread_id = update.message.message_thread_id
+    if not thread_id:
+        await update.message.reply_text("❌ Напишите /setreports внутри нужной темы Telegram-группы.")
         return
-
-    text = (
-        f"💰 KPI за {month}\n\n"
-        f"KPI №1 — выполнение задач в срок:\n"
-        f"{data['on_time_percent']}%\n"
-        f"Сумма: {data['kpi_deadline']} ₽\n\n"
-        f"KPI №2 — качество:\n"
-        f"Проблемных задач: {data['bad_percent']}%\n"
-        f"Сумма: {data['kpi_quality']} ₽\n\n"
-        f"Баллы: {data['total_points']}\n\n"
-        f"Итого KPI: {data['total_kpi']} ₽"
-    )
-
-    await update.effective_message.reply_text(text)
-    await send_to_saved_thread(context, update.effective_chat.id, "reports_thread_id", text)
+    set_setting(f"reports_topic:{update.effective_chat.id}", str(thread_id))
+    set_setting("reports_chat_id", str(update.effective_chat.id))
+    await update.message.reply_text("✅ Эта тема назначена темой отчётов.")
 
 
-async def savekpi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    month = context.args[0] if context.args else month_text()
-    data = get_kpi_data(month)
-
-    if not data:
-        await update.effective_message.reply_text(f"📭 За {month} нечего сохранять.")
+async def fixquality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
+        await update.message.reply_text("❌ Формат: /fixquality ID 0/1")
         return
-
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO kpi_archive
-        (month, total_tasks, on_time_tasks, on_time_percent, bad_tasks,
-         bad_percent, total_points, kpi_deadline, kpi_quality, total_kpi, saved_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data["month"],
-        data["total_tasks"],
-        data["on_time_tasks"],
-        data["on_time_percent"],
-        data["bad_tasks"],
-        data["bad_percent"],
-        data["total_points"],
-        data["kpi_deadline"],
-        data["kpi_quality"],
-        data["total_kpi"],
-        now_text(),
-    ))
-    conn.commit()
-    conn.close()
-
-    await update.effective_message.reply_text(f"✅ KPI за {month} сохранён в архив.")
+    task_id = int(context.args[0]); val = int(context.args[1])
+    with db() as conn:
+        conn.execute("UPDATE tasks SET quality_flag=? WHERE id=?", (val, task_id))
+    log_action(task_id, "fixquality", user_name(update), str(val))
+    await update.message.reply_text(f"✅ Качество задачи #{task_id} исправлено на {val}.")
 
 
-async def kpi_history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    conn = connect()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT month, total_tasks, on_time_percent, bad_percent,
-               total_points, total_kpi, saved_at
-        FROM kpi_archive
-        ORDER BY id DESC
-        LIMIT 12
-    """)
-    rows = cur.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.effective_message.reply_text("📭 Архив KPI пока пуст.")
+async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
+        await update.message.reply_text("❌ Формат: /fixdeadline ID 0/1")
         return
+    task_id = int(context.args[0]); late = int(context.args[1])
+    on_time = 0 if late else 1
+    with db() as conn:
+        conn.execute("UPDATE tasks SET on_time=? WHERE id=?", (on_time, task_id))
+    log_action(task_id, "fixdeadline", user_name(update), f"late={late}")
+    await update.message.reply_text(f"✅ Просрочка задачи #{task_id} исправлена. Просрочено: {'да' if late else 'нет'}.")
 
-    text = "📚 История KPI:\n\n"
-    for row in rows:
-        month, total_tasks, on_time_percent, bad_percent, total_points, total_kpi, saved_at = row
-        text += (
-            f"{month}\n"
-            f"Задач: {total_tasks}\n"
-            f"В срок: {on_time_percent}%\n"
-            f"Проблемных: {bad_percent}%\n"
-            f"Баллы: {total_points}\n"
-            f"KPI: {total_kpi} ₽\n"
-            f"Сохранено: {saved_at}\n\n"
-        )
 
-    await update.effective_message.reply_text(text)
+async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
+    if date.today().day != 1:
+        return
+    month = previous_month()
+    with db() as conn:
+        sent = conn.execute("SELECT month FROM monthly_reports WHERE month=?", (month,)).fetchone()
+    if sent:
+        return
+    chat_id = get_setting("reports_chat_id")
+    if not chat_id:
+        return
+    topic = get_setting(f"reports_topic:{chat_id}")
+    try:
+        await context.bot.send_message(chat_id=int(chat_id), message_thread_id=int(topic) if topic else None, text=report_text(month), parse_mode=ParseMode.HTML)
+        with db() as conn:
+            conn.execute("INSERT INTO monthly_reports(month,sent_at) VALUES(?,?)", (month, now_iso()))
+    except Exception as e:
+        logger.warning("Monthly report failed: %s", e)
 
 
 def main() -> None:
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "Не найден BOT_TOKEN. Добавь переменную окружения BOT_TOKEN в Railway или вставь токен в код."
-        )
-
+        raise RuntimeError("BOT_TOKEN не найден. Добавьте переменную окружения BOT_TOKEN.")
     init_db()
+    app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
-
-    app.add_handler(CommandHandler("setlog", setlog))
-    app.add_handler(CommandHandler("setreports", setreports))
-
-    app.add_handler(CommandHandler("task", task))
-    app.add_handler(CommandHandler("ok", ok))
-    app.add_handler(CommandHandler("done", done))
-    app.add_handler(CommandHandler("rework", rework))
-    app.add_handler(CommandHandler("tasks", tasks))
-    app.add_handler(CommandHandler("taskinfo", taskinfo))
-
-    app.add_handler(CommandHandler("score", score))
-    app.add_handler(CommandHandler("myscore", myscore))
-
-    app.add_handler(CommandHandler("stats", stats))
-    app.add_handler(CommandHandler("kpi", kpi))
-    app.add_handler(CommandHandler("savekpi", savekpi))
-    app.add_handler(CommandHandler("kpi_history", kpi_history))
-
-    print("Бот запущен.")
-    app.run_polling()
+    handlers = [
+        ("start", start), ("help", help_cmd), ("adminhelp", adminhelp_cmd),
+        ("task", task_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
+        ("tasks", tasks_cmd), ("mytasks", mytasks_cmd), ("taskinfo", taskinfo_cmd),
+        ("me", me_cmd), ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd),
+        ("adddesigner", adddesigner_cmd), ("removedesigner", removedesigner_cmd), ("designers", designers_cmd),
+        ("setshiftstart", setshiftstart_cmd), ("online", online_cmd), ("week", week_cmd), ("swap", swap_cmd), ("clearswap", clearswap_cmd),
+        ("setlog", setlog_cmd), ("setreports", setreports_cmd),
+        ("fixquality", fixquality_cmd), ("fixdeadline", fixdeadline_cmd),
+    ]
+    for name, fn in handlers:
+        app.add_handler(CommandHandler(name, fn))
+    app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
