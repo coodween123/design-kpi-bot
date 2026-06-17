@@ -716,6 +716,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Пример:
 {html_quote_code('/task Обложка, 31.07.2026 18:00, сделать дизайн обложки')}
 
+🔷 /retask — изменить задачу
+
+Можно поменять название, дедлайн и описание. Чтобы оставить поле без изменений, поставьте <code>-</code>.
+
+Примеры:
+{html_quote_code('/retask 15, Новая обложка, 31.07.2026 19:00, новое описание')}
+{html_quote_code('/retask 15, -, 31.07.2026 19:00, -')}
+
 🔷 /ok — взять задачу
 
 Можно также поставить любую реакцию на сообщение бота о задаче — если реакцию ставит активный дизайнер, задача примется на него.
@@ -865,6 +873,7 @@ async def setup_commands(app: Application):
     await app.bot.set_my_commands([
         BotCommand("help", "🔷 основная справка"),
         BotCommand("task", "🔷 создать задачу"),
+        BotCommand("retask", "🔷 изменить задачу"),
         BotCommand("tasks", "🔷 активные задачи"),
         BotCommand("mytasks", "🔷 мои задачи"),
         BotCommand("me", "🔷 моя статистика"),
@@ -943,6 +952,86 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     remember_task_message(task_id, reply_msg, "task_reply")
     log_msg = await send_log(context, update.effective_chat.id, f"<b>✅ Создана задача #{task_id}</b>\n\n<b>{title}</b>\nДедлайн: {deadline.strftime(DATETIME_FMT)}\nАвтор: {creator}\n\n{desc}")
     remember_task_message(task_id, log_msg, "task_log")
+
+
+async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.partition(" ")[2]
+    parts = [p.strip() for p in raw.split(",", 3)]
+    if len(parts) != 4 or not parts[0].isdigit():
+        await update.message.reply_text(
+            "❌ Формат: /retask ID, Название, 31.07.2026 18:00, Описание\n\n"
+            "Чтобы оставить поле без изменений, поставьте -\n"
+            "Пример: /retask 15, -, 31.07.2026 19:00, -"
+        )
+        return
+
+    task_id = int(parts[0])
+    title_s, deadline_s, desc_s = parts[1], parts[2], parts[3]
+    row = task_by_id(task_id)
+    if not row:
+        await update.message.reply_text("❌ Задача не найдена.")
+        return
+
+    new_title = row["title"] if title_s in {"-", "—"} else title_s
+    new_desc = row["description"] if desc_s in {"-", "—"} else desc_s
+    if not new_title or not new_desc:
+        await update.message.reply_text("❌ Название и описание не могут быть пустыми.")
+        return
+
+    if deadline_s in {"-", "—"}:
+        new_deadline = parse_iso_msk(row["deadline"])
+    else:
+        try:
+            new_deadline = parse_dt(deadline_s)
+        except ValueError:
+            await update.message.reply_text("❌ Дедлайн нужен в формате: 31.07.2026 18:00")
+            return
+
+    current_msk = now_msk()
+    if row["status"] != STATUSES["done"] and new_deadline <= current_msk:
+        await update.message.reply_text(f"❌ Нельзя поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
+        return
+
+    on_time = row["on_time"]
+    if row["completed_at"]:
+        on_time = 1 if parse_iso_msk(row["completed_at"]) <= new_deadline else 0
+
+    actor = user_name(update)
+    old_deadline = fmt_dt(row["deadline"])
+    new_deadline_iso = new_deadline.isoformat(timespec="seconds")
+    with db() as conn:
+        conn.execute(
+            """UPDATE tasks
+               SET title=?, description=?, deadline=?, on_time=?
+               WHERE id=?""",
+            (new_title, new_desc, new_deadline_iso, on_time, task_id),
+        )
+        if row["status"] != STATUSES["done"]:
+            conn.execute("DELETE FROM deadline_alerts WHERE task_id=?", (task_id,))
+
+    comment = (
+        f"title: {row['title']} -> {new_title}; "
+        f"deadline: {old_deadline} -> {new_deadline.strftime(DATETIME_FMT)}"
+    )
+    log_action(task_id, "retask", actor, comment, row["status"], row["status"])
+
+    deadline_status = ""
+    if row["completed_at"]:
+        deadline_status = f"\nСрок после правки: {'в срок' if on_time else 'просрочен'}"
+    await update.message.reply_text(
+        f"✅ Задача #{task_id} изменена.\n\n"
+        f"Название: {new_title}\n"
+        f"Дедлайн: {new_deadline.strftime(DATETIME_FMT)}"
+        f"{deadline_status}"
+    )
+    await send_log(
+        context,
+        update.effective_chat.id,
+        f"<b>✏️ Изменена задача #{task_id}</b>\n"
+        f"Кто изменил: {html.escape(actor)}\n"
+        f"Название: {html.escape(row['title'])} → {html.escape(new_title)}\n"
+        f"Дедлайн: {html.escape(old_deadline)} → {new_deadline.strftime(DATETIME_FMT)}",
+    )
 
 
 async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1560,7 +1649,7 @@ def main() -> None:
 
     handlers = [
         ("start", start), ("help", help_cmd), ("adminhelp", adminhelp_cmd), ("time", time_cmd),
-        ("task", task_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
+        ("task", task_cmd), ("retask", retask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
         ("tasks", tasks_cmd), ("mytasks", mytasks_cmd), ("taskinfo", taskinfo_cmd),
         ("me", me_cmd), ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd), ("history", history_cmd),
         ("adddesigner", adddesigner_cmd), ("removedesigner", removedesigner_cmd), ("designers", designers_cmd),
