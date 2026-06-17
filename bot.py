@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import html
+import re
 import sqlite3
 import zipfile
 import logging
@@ -47,6 +48,26 @@ def now_iso() -> str:
 
 def parse_dt(value: str) -> datetime:
     return datetime.strptime(value.strip(), DATETIME_FMT).replace(tzinfo=MSK)
+
+
+TASK_BODY_RE = re.compile(r"^\s*(?P<title>.+?)\s+(?P<date>\d{2}\.\d{2}\.\d{4})\s+(?P<time>\d{2}:\d{2})\s+(?P<desc>.+?)\s*$")
+
+
+def parse_task_body(raw: str) -> tuple[Optional[str], Optional[datetime], Optional[str], Optional[str]]:
+    if "," in raw:
+        return None, None, None, "Пишите без запятых: Название 31.07.2026 18:00 Описание"
+    match = TASK_BODY_RE.match(raw)
+    if not match:
+        return None, None, None, "Формат: Название 31.07.2026 18:00 Описание"
+    title = match.group("title").strip()
+    desc = match.group("desc").strip()
+    if not title or not desc:
+        return None, None, None, "Заполните название, дату, время и описание."
+    try:
+        deadline = parse_dt(f"{match.group('date')} {match.group('time')}")
+    except ValueError:
+        return None, None, None, "Дедлайн нужен в формате: 31.07.2026 18:00"
+    return title, deadline, desc, None
 
 
 def parse_date(value: str) -> date:
@@ -714,15 +735,14 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔷 /task — создать задачу
 
 Пример:
-{html_quote_code('/task Обложка, 31.07.2026 18:00, сделать дизайн обложки')}
+{html_quote_code('/task Обложка 31.07.2026 18:00 сделать дизайн обложки')}
 
 🔷 /retask — изменить задачу
 
-Можно поменять название, дедлайн и описание. Чтобы оставить поле без изменений, поставьте <code>-</code>.
+Меняет задачу полностью: название, дату, время и описание.
 
-Примеры:
-{html_quote_code('/retask 15, Новая обложка, 31.07.2026 19:00, новое описание')}
-{html_quote_code('/retask 15, -, 31.07.2026 19:00, -')}
+Пример:
+{html_quote_code('/retask 15 Новая обложка 31.07.2026 19:00 новое описание')}
 
 🔷 /ok — взять задачу
 
@@ -921,18 +941,12 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
-    parts = [p.strip() for p in raw.split(",", 2)]
-    if len(parts) != 3:
-        await update.message.reply_text("❌ Формат: /task Название, 31.07.2026 18:00, Описание")
+    title, deadline, desc, error = parse_task_body(raw)
+    if error:
+        await update.message.reply_text(f"❌ {error}\nПример: /task Обложка 31.07.2026 18:00 сделать дизайн обложки")
         return
-    title, deadline_s, desc = parts
-    if not title or not deadline_s or not desc:
-        await update.message.reply_text("❌ Заполните название, дедлайн и описание.\nФормат: /task Название, 31.07.2026 18:00, Описание")
-        return
-    try:
-        deadline = parse_dt(deadline_s)
-    except ValueError:
-        await update.message.reply_text("❌ Дедлайн нужен в формате: 31.07.2026 18:00")
+    if not title or not deadline or not desc:
+        await update.message.reply_text("❌ Формат: /task Название 31.07.2026 18:00 Описание")
         return
     current_msk = now_msk()
     if deadline <= current_msk:
@@ -956,36 +970,27 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
-    parts = [p.strip() for p in raw.split(",", 3)]
-    if len(parts) != 4 or not parts[0].isdigit():
+    task_id_s, sep, body = raw.partition(" ")
+    if not sep or not task_id_s.isdigit():
         await update.message.reply_text(
-            "❌ Формат: /retask ID, Название, 31.07.2026 18:00, Описание\n\n"
-            "Чтобы оставить поле без изменений, поставьте -\n"
-            "Пример: /retask 15, -, 31.07.2026 19:00, -"
+            "❌ Формат: /retask ID Название 31.07.2026 18:00 Описание\n"
+            "Пример: /retask 15 Новая обложка 31.07.2026 19:00 новое описание"
         )
         return
 
-    task_id = int(parts[0])
-    title_s, deadline_s, desc_s = parts[1], parts[2], parts[3]
+    task_id = int(task_id_s)
     row = task_by_id(task_id)
     if not row:
         await update.message.reply_text("❌ Задача не найдена.")
         return
 
-    new_title = row["title"] if title_s in {"-", "—"} else title_s
-    new_desc = row["description"] if desc_s in {"-", "—"} else desc_s
-    if not new_title or not new_desc:
-        await update.message.reply_text("❌ Название и описание не могут быть пустыми.")
+    new_title, new_deadline, new_desc, error = parse_task_body(body)
+    if error:
+        await update.message.reply_text(f"❌ {error}\nПример: /retask 15 Новая обложка 31.07.2026 19:00 новое описание")
         return
-
-    if deadline_s in {"-", "—"}:
-        new_deadline = parse_iso_msk(row["deadline"])
-    else:
-        try:
-            new_deadline = parse_dt(deadline_s)
-        except ValueError:
-            await update.message.reply_text("❌ Дедлайн нужен в формате: 31.07.2026 18:00")
-            return
+    if not new_title or not new_deadline or not new_desc:
+        await update.message.reply_text("❌ Формат: /retask ID Название 31.07.2026 18:00 Описание")
+        return
 
     current_msk = now_msk()
     if row["status"] != STATUSES["done"] and new_deadline <= current_msk:
