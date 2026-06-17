@@ -219,7 +219,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"""
-<b>🎨 DESIGN KPI BOT</b>
+<b>🔷 Дизайнер Аны Мавричевой</b>
 
 Система учёта задач, KPI-статистики и графика работы дизайнеров.
 
@@ -227,74 +227,69 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>🚀 Основные команды</b>
 
-Создать задачу:
-{html_quote_code('/task Название | Дедлайн | Описание')}
+🔷 /task — создать задачу
 Пример:
 {html_quote_code('/task Баннер VK | 31.07.2026 18:00 | Сделать баннер для рекламы курса')}
 
-Взять задачу:
-{html_quote_code('/ok ID')}
+🔷 /ok — взять задачу
 Пример:
 {html_quote_code('/ok 15')}
 
-Завершить задачу:
-{html_quote_code('/done ID 0/1')}
+🔷 /done — завершить задачу
 <code>0</code> — до 3 правок
 <code>1</code> — более 3 правок
 Пример:
 {html_quote_code('/done 15 0')}
 
-Переназначить исполнителя:
-{html_quote_code('/reassign ID @username')}
+🔷 /reassign — переназначить исполнителя
 Пример:
 {html_quote_code('/reassign 15 @anna')}
 
-Отправить на доработку:
-{html_quote_code('/rework ID Причина')}
+🔷 /rework — отправить на доработку
+Пример:
+{html_quote_code('/rework 15 Нужны правки')}
 
-Активные задачи:
-{html_quote_code('/tasks')}
+🔷 /tasks — активные задачи
 
-Мои задачи:
-{html_quote_code('/mytasks')}
+🔷 /mytasks — мои задачи
 
-Карточка задачи:
-{html_quote_code('/taskinfo ID')}
+🔷 /taskinfo — карточка задачи
+Пример:
+{html_quote_code('/taskinfo 15')}
 
 ━━━━━━━━━━━━━━
 
 <b>👤 Личная статистика</b>
 
-{html_quote_code('/me')}
+🔷 /me — моя статистика
+Пример:
 {html_quote_code('/me 07.2026')}
 
 ━━━━━━━━━━━━━━
 
 <b>📊 Статистика команды</b>
 
-{html_quote_code('/stats')}
-{html_quote_code('/report')}
-{html_quote_code('/top')}
+🔷 /stats — статистика команды
+
+🔷 /report — месячный отчёт
+
+🔷 /top — рейтинг
 
 ━━━━━━━━━━━━━━
 
 <b>📅 График работы</b>
 
-Кто сегодня работает:
-{html_quote_code('/online')}
-
-Кто работает в дату:
+🔷 /online — кто сегодня работает
+Пример:
 {html_quote_code('/online 05.08.2026')}
 
-График на 7 дней:
-{html_quote_code('/week')}
+🔷 /week — график на 7 дней
 
 ━━━━━━━━━━━━━━
 
 <b>🔧 Админ-команды</b>
 
-Полный список:
-{html_quote_code('/adminhelp')}
+🔷 /adminhelp — полный список
 """.strip()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -308,37 +303,51 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 ━━━━━━━━━━━━━━
 
 <b>👨‍🎨 Дизайнеры</b>
-Добавить дизайнера:
+
+🔷 /adddesigner — добавить дизайнера
+Пример:
 {html_quote_code('/adddesigner @username')}
-Удалить дизайнера из активных:
+
+🔷 /removedesigner — удалить дизайнера из активных
+Пример:
 {html_quote_code('/removedesigner @username')}
-Список дизайнеров:
-{html_quote_code('/designers')}
+
+🔷 /designers — список дизайнеров
 
 ━━━━━━━━━━━━━━
 
 <b>📅 График работы 2/2</b>
-Задать старт графика:
+
+🔷 /setshiftstart — задать старт графика
+Пример:
 {html_quote_code('/setshiftstart 01.08.2026 @george')}
-Назначить подмену:
+
+🔷 /swap — назначить подмену
+Пример:
 {html_quote_code('/swap 05.08.2026 @anna Подмена Георгия')}
-Убрать подмену:
+
+🔷 /clearswap — убрать подмену
+Пример:
 {html_quote_code('/clearswap 05.08.2026')}
 
 ━━━━━━━━━━━━━━
 
 <b>📋 Настройка тем</b>
-Назначить текущую тему логом задач:
-{html_quote_code('/setlog')}
-Назначить текущую тему для отчётов:
-{html_quote_code('/setreports')}
+
+🔷 /setlog — назначить текущую тему логом задач
+
+🔷 /setreports — назначить текущую тему для отчётов
 
 ━━━━━━━━━━━━━━
 
 <b>🛠 Исправление ошибок</b>
-Исправить качество:
+
+🔷 /fixquality — исправить качество
+Пример:
 {html_quote_code('/fixquality ID 0/1')}
-Исправить просрочку:
+
+🔷 /fixdeadline — исправить просрочку
+Пример:
 {html_quote_code('/fixdeadline ID 0/1')}
 """.strip()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -346,19 +355,18 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def setup_commands(app: Application):
     await app.bot.set_my_commands([
-        BotCommand("help", "основная справка"),
-        BotCommand("task", "создать задачу"),
-        BotCommand("tasks", "активные задачи"),
-        BotCommand("mytasks", "мои задачи"),
-        BotCommand("me", "моя статистика"),
-        BotCommand("stats", "статистика команды"),
-        BotCommand("report", "месячный отчёт"),
-        BotCommand("top", "рейтинг"),
-        BotCommand("online", "кто сегодня работает"),
-        BotCommand("week", "график на 7 дней"),
-        BotCommand("adminhelp", "технические команды"),
+        BotCommand("help", "🔷 основная справка"),
+        BotCommand("task", "🔷 создать задачу"),
+        BotCommand("tasks", "🔷 активные задачи"),
+        BotCommand("mytasks", "🔷 мои задачи"),
+        BotCommand("me", "🔷 моя статистика"),
+        BotCommand("stats", "🔷 статистика команды"),
+        BotCommand("report", "🔷 месячный отчёт"),
+        BotCommand("top", "🔷 рейтинг"),
+        BotCommand("online", "🔷 кто сегодня работает"),
+        BotCommand("week", "🔷 график на 7 дней"),
+        BotCommand("adminhelp", "🔷 технические команды"),
     ])
-
 
 async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
