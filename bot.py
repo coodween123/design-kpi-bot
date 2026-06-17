@@ -2,6 +2,7 @@ import os
 import sqlite3
 import logging
 from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
 from collections import Counter, defaultdict
 from typing import Optional, Tuple, List
 
@@ -13,6 +14,7 @@ DB_PATH = os.getenv("DB_PATH", "design_kpi_bot.sqlite3")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATE_FMT = "%d.%m.%Y"
 DATETIME_FMT = "%d.%m.%Y %H:%M"
+MSK = ZoneInfo("Europe/Moscow")
 STATUSES = {
     "waiting": "ожидает принятия",
     "in_progress": "в работе",
@@ -25,11 +27,11 @@ logger = logging.getLogger(__name__)
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return datetime.now(MSK).isoformat(timespec="seconds")
 
 
 def parse_dt(value: str) -> datetime:
-    return datetime.strptime(value.strip(), DATETIME_FMT)
+    return datetime.strptime(value.strip(), DATETIME_FMT).replace(tzinfo=MSK)
 
 
 def parse_date(value: str) -> date:
@@ -41,11 +43,11 @@ def month_key(dt: datetime | date) -> str:
 
 
 def current_month() -> str:
-    return datetime.now().strftime("%m.%Y")
+    return datetime.now(MSK).strftime("%m.%Y")
 
 
 def previous_month() -> str:
-    first = date.today().replace(day=1)
+    first = datetime.now(MSK).date().replace(day=1)
     prev = first - timedelta(days=1)
     return prev.strftime("%m.%Y")
 
@@ -53,11 +55,16 @@ def previous_month() -> str:
 def fmt_dt(iso: Optional[str]) -> str:
     if not iso:
         return "—"
-    return datetime.fromisoformat(iso).strftime(DATETIME_FMT)
+    return parse_iso_msk(iso).strftime(DATETIME_FMT)
 
 
 def fmt_date(d: date) -> str:
     return d.strftime(DATE_FMT)
+
+
+def parse_iso_msk(value: str) -> datetime:
+    dt = datetime.fromisoformat(value)
+    return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
 
 
 def user_name(update: Update) -> str:
@@ -209,7 +216,7 @@ def avg_completion(rows) -> Optional[float]:
         if not r["completed_at"]:
             continue
         start = r["accepted_at"] or r["created_at"]
-        durations.append((datetime.fromisoformat(r["completed_at"]) - datetime.fromisoformat(start)).total_seconds())
+        durations.append((parse_iso_msk(r["completed_at"]) - parse_iso_msk(start)).total_seconds())
     return sum(durations) / len(durations) if durations else None
 
 
@@ -228,24 +235,30 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 <b>🚀 Основные команды</b>
 
 🔷 /task — создать задачу
+
 Пример:
 {html_quote_code('/task Баннер VK | 31.07.2026 18:00 | Сделать баннер для рекламы курса')}
 
 🔷 /ok — взять задачу
+
 Пример:
 {html_quote_code('/ok 15')}
 
 🔷 /done — завершить задачу
+
 <code>0</code> — до 3 правок
 <code>1</code> — более 3 правок
+
 Пример:
 {html_quote_code('/done 15 0')}
 
 🔷 /reassign — переназначить исполнителя
+
 Пример:
 {html_quote_code('/reassign 15 @anna')}
 
 🔷 /rework — отправить на доработку
+
 Пример:
 {html_quote_code('/rework 15 Нужны правки')}
 
@@ -254,6 +267,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 🔷 /mytasks — мои задачи
 
 🔷 /taskinfo — карточка задачи
+
 Пример:
 {html_quote_code('/taskinfo 15')}
 
@@ -261,7 +275,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>👤 Личная статистика</b>
 
-🔷 /me — моя статистика
+🔷 /me
+
 Пример:
 {html_quote_code('/me 07.2026')}
 
@@ -269,30 +284,30 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>📊 Статистика команды</b>
 
-🔷 /stats — статистика команды
+🔷 /stats
 
-🔷 /report — месячный отчёт
+🔷 /report
 
-🔷 /top — рейтинг
+🔷 /top
 
 ━━━━━━━━━━━━━━
 
 <b>📅 График работы</b>
 
-🔷 /online — кто сегодня работает
+🔷 /online
+
 Пример:
 {html_quote_code('/online 05.08.2026')}
 
-🔷 /week — график на 7 дней
+🔷 /week
 
 ━━━━━━━━━━━━━━
 
 <b>🔧 Админ-команды</b>
 
-🔷 /adminhelp — полный список
+🔷 /adminhelp
 """.strip()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
 
 async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = f"""
@@ -304,29 +319,34 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>👨‍🎨 Дизайнеры</b>
 
-🔷 /adddesigner — добавить дизайнера
+🔷 /adddesigner
+
 Пример:
 {html_quote_code('/adddesigner @username')}
 
-🔷 /removedesigner — удалить дизайнера из активных
+🔷 /removedesigner
+
 Пример:
 {html_quote_code('/removedesigner @username')}
 
-🔷 /designers — список дизайнеров
+🔷 /designers
 
 ━━━━━━━━━━━━━━
 
 <b>📅 График работы 2/2</b>
 
-🔷 /setshiftstart — задать старт графика
+🔷 /setshiftstart
+
 Пример:
 {html_quote_code('/setshiftstart 01.08.2026 @george')}
 
-🔷 /swap — назначить подмену
+🔷 /swap
+
 Пример:
 {html_quote_code('/swap 05.08.2026 @anna Подмена Георгия')}
 
-🔷 /clearswap — убрать подмену
+🔷 /clearswap
+
 Пример:
 {html_quote_code('/clearswap 05.08.2026')}
 
@@ -334,24 +354,25 @@ async def adminhelp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 <b>📋 Настройка тем</b>
 
-🔷 /setlog — назначить текущую тему логом задач
+🔷 /setlog
 
-🔷 /setreports — назначить текущую тему для отчётов
+🔷 /setreports
 
 ━━━━━━━━━━━━━━
 
 <b>🛠 Исправление ошибок</b>
 
-🔷 /fixquality — исправить качество
+🔷 /fixquality
+
 Пример:
 {html_quote_code('/fixquality ID 0/1')}
 
-🔷 /fixdeadline — исправить просрочку
+🔷 /fixdeadline
+
 Пример:
 {html_quote_code('/fixdeadline ID 0/1')}
 """.strip()
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
-
 
 async def setup_commands(app: Application):
     await app.bot.set_my_commands([
@@ -386,7 +407,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cur = conn.execute(
             """INSERT INTO tasks(title,description,created_by,created_at,deadline,status,created_month)
                VALUES(?,?,?,?,?,?,?)""",
-            (title, desc, creator, created_at, deadline.isoformat(timespec="seconds"), STATUSES["waiting"], month_key(datetime.fromisoformat(created_at))),
+            (title, desc, creator, created_at, deadline.isoformat(timespec="seconds"), STATUSES["waiting"], month_key(parse_iso_msk(created_at))),
         )
         task_id = cur.lastrowid
     log_action(task_id, "create", creator, title, "", STATUSES["waiting"])
@@ -447,8 +468,8 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text("❌ Задача не найдена.")
         return
-    completed_at = datetime.now()
-    deadline = datetime.fromisoformat(row["deadline"])
+    completed_at = datetime.now(MSK)
+    deadline = parse_iso_msk(row["deadline"])
     on_time = 1 if completed_at <= deadline else 0
     actor = user_name(update)
     with db() as conn:
@@ -746,7 +767,7 @@ async def setshiftstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        d = parse_date(context.args[0]) if context.args else date.today()
+        d = parse_date(context.args[0]) if context.args else datetime.now(MSK).date()
     except ValueError:
         await update.message.reply_text("❌ Дата нужна в формате: 05.08.2026")
         return
@@ -768,7 +789,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start = date.today()
+    start = datetime.now(MSK).date()
     lines = ["<b>📅 ГРАФИК НА 7 ДНЕЙ</b>", "━━━━━━━━━━━━━━"]
     for i in range(7):
         d = start + timedelta(days=i)
@@ -860,7 +881,7 @@ async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
-    if date.today().day != 1:
+    if datetime.now(MSK).day != 1:
         return
     month = previous_month()
     with db() as conn:
