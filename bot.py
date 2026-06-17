@@ -4,7 +4,10 @@ from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
-BOT_TOKEN = "BOT_TOKEN"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    raise RuntimeError("Не найден BOT_TOKEN. Добавь переменную BOT_TOKEN в Railway Variables.")
 DB_NAME = "design_kpi_bot.db"
 
 
