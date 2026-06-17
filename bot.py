@@ -1,10 +1,11 @@
 import os
+import json
 import sqlite3
 import logging
 from datetime import datetime, date, timedelta
 from zoneinfo import ZoneInfo
 from collections import Counter, defaultdict
-from typing import Optional, Tuple, List
+from typing import Any, Optional, Tuple, List
 
 from telegram import Update, BotCommand
 from telegram.constants import ParseMode
@@ -14,7 +15,8 @@ DB_PATH = os.getenv("DB_PATH", "design_kpi_bot.sqlite3")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATE_FMT = "%d.%m.%Y"
 DATETIME_FMT = "%d.%m.%Y %H:%M"
-MSK = ZoneInfo("Europe/Moscow")
+TZ_NAME = "Europe/Moscow"
+MSK = ZoneInfo(TZ_NAME)
 STATUSES = {
     "waiting": "ожидает принятия",
     "in_progress": "в работе",
@@ -26,8 +28,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 
+def now_msk() -> datetime:
+    return datetime.now(MSK)
+
+
 def now_iso() -> str:
-    return datetime.now(MSK).isoformat(timespec="seconds")
+    return now_msk().isoformat(timespec="seconds")
 
 
 def parse_dt(value: str) -> datetime:
@@ -43,11 +49,11 @@ def month_key(dt: datetime | date) -> str:
 
 
 def current_month() -> str:
-    return datetime.now(MSK).strftime("%m.%Y")
+    return now_msk().strftime("%m.%Y")
 
 
 def previous_month() -> str:
-    first = datetime.now(MSK).date().replace(day=1)
+    first = now_msk().date().replace(day=1)
     prev = first - timedelta(days=1)
     return prev.strftime("%m.%Y")
 
@@ -64,7 +70,7 @@ def fmt_date(d: date) -> str:
 
 def parse_iso_msk(value: str) -> datetime:
     dt = datetime.fromisoformat(value)
-    return dt if dt.tzinfo else dt.replace(tzinfo=MSK)
+    return dt.astimezone(MSK) if dt.tzinfo else dt.replace(tzinfo=MSK)
 
 
 def user_name(update: Update) -> str:
@@ -94,13 +100,15 @@ def human_duration(seconds: Optional[float]) -> str:
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 
 def init_db() -> None:
     with db() as conn:
+        conn.execute("PRAGMA journal_mode = WAL")
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -143,6 +151,34 @@ def init_db() -> None:
             new_status TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS bot_actions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            chat_id INTEGER,
+            chat_title TEXT,
+            message_id INTEGER,
+            thread_id INTEGER,
+            user_id INTEGER,
+            username TEXT,
+            user_display TEXT,
+            command TEXT NOT NULL,
+            args TEXT,
+            text TEXT,
+            status TEXT NOT NULL,
+            error TEXT,
+            duration_ms INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS stats_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            month TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            requested_by TEXT,
+            payload_json TEXT NOT NULL,
+            rendered_text TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS shift_overrides (
             date TEXT PRIMARY KEY,
             designer TEXT NOT NULL,
@@ -160,6 +196,10 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_tasks_completed_month ON tasks(completed_month);
         CREATE INDEX IF NOT EXISTS idx_tasks_created_month ON tasks(created_month);
         CREATE INDEX IF NOT EXISTS idx_tasks_accepted_by ON tasks(accepted_by);
+        CREATE INDEX IF NOT EXISTS idx_task_log_created_at ON task_log(created_at);
+        CREATE INDEX IF NOT EXISTS idx_bot_actions_created_at ON bot_actions(created_at);
+        CREATE INDEX IF NOT EXISTS idx_bot_actions_command ON bot_actions(command);
+        CREATE INDEX IF NOT EXISTS idx_stats_snapshots_month_scope ON stats_snapshots(month, scope);
         """)
 
 
@@ -180,6 +220,71 @@ def log_action(task_id: Optional[int], action: str, user: str, comment: str = ""
             "INSERT INTO task_log(created_at,task_id,action,user,comment,old_status,new_status) VALUES(?,?,?,?,?,?,?)",
             (now_iso(), task_id, action, user, comment, old_status, new_status),
         )
+
+
+def log_command_start(command: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    text = ""
+    if message:
+        text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+    chat_title = ""
+    if chat:
+        chat_title = getattr(chat, "title", None) or getattr(chat, "full_name", None) or ""
+    username = f"@{user.username}" if user and user.username else ""
+    try:
+        with db() as conn:
+            cur = conn.execute(
+                """INSERT INTO bot_actions(
+                    created_at, chat_id, chat_title, message_id, thread_id,
+                    user_id, username, user_display, command, args, text, status
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    now_iso(),
+                    chat.id if chat else None,
+                    chat_title,
+                    message.message_id if message else None,
+                    getattr(message, "message_thread_id", None) if message else None,
+                    user.id if user else None,
+                    username,
+                    user_name(update),
+                    command,
+                    " ".join(context.args or []),
+                    text,
+                    "started",
+                ),
+            )
+            return int(cur.lastrowid)
+    except Exception as e:
+        logger.warning("Cannot write command log: %s", e)
+        return None
+
+
+def finish_command_log(action_id: Optional[int], status: str, started_at: datetime, error: str = "") -> None:
+    if action_id is None:
+        return
+    duration_ms = int((now_msk() - started_at).total_seconds() * 1000)
+    try:
+        with db() as conn:
+            conn.execute(
+                "UPDATE bot_actions SET status=?, error=?, duration_ms=? WHERE id=?",
+                (status, error, duration_ms, action_id),
+            )
+    except Exception as e:
+        logger.warning("Cannot update command log: %s", e)
+
+
+def save_stats_snapshot(month: str, scope: str, requested_by: str, payload: dict[str, Any], rendered_text: str) -> None:
+    try:
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO stats_snapshots(created_at,month,scope,requested_by,payload_json,rendered_text)
+                   VALUES(?,?,?,?,?,?)""",
+                (now_iso(), month, scope, requested_by, json.dumps(payload, ensure_ascii=False, sort_keys=True), rendered_text),
+            )
+    except Exception as e:
+        logger.warning("Cannot save stats snapshot: %s", e)
 
 
 async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
@@ -218,6 +323,125 @@ def avg_completion(rows) -> Optional[float]:
         start = r["accepted_at"] or r["created_at"]
         durations.append((parse_iso_msk(r["completed_at"]) - parse_iso_msk(start)).total_seconds())
     return sum(durations) / len(durations) if durations else None
+
+
+def counter_payload(items) -> list[dict[str, Any]]:
+    return [{"name": name, "count": count} for name, count in items]
+
+
+def stats_payload(month: str, personal_user: Optional[str] = None) -> dict[str, Any]:
+    rows = completed_rows(month, personal_user)
+    total_done = len(rows)
+    ontime = sum(1 for r in rows if r["on_time"] == 1)
+    late = sum(1 for r in rows if r["on_time"] == 0)
+    quality_bad = sum(1 for r in rows if r["quality_flag"] == 1)
+    quality_good = total_done - quality_bad
+    avg_seconds = avg_completion(rows)
+
+    with db() as conn:
+        if personal_user:
+            created = conn.execute(
+                "SELECT COUNT(*) c FROM tasks WHERE created_month=? AND created_by=?",
+                (month, personal_user),
+            ).fetchone()["c"]
+            active = conn.execute(
+                "SELECT COUNT(*) c FROM tasks WHERE status!=? AND accepted_by=?",
+                (STATUSES["done"], personal_user),
+            ).fetchone()["c"]
+            in_work = conn.execute(
+                "SELECT COUNT(*) c FROM tasks WHERE status=? AND accepted_by=?",
+                (STATUSES["in_progress"], personal_user),
+            ).fetchone()["c"]
+            rework = conn.execute(
+                "SELECT COUNT(*) c FROM tasks WHERE status=? AND accepted_by=?",
+                (STATUSES["rework"], personal_user),
+            ).fetchone()["c"]
+        else:
+            created = conn.execute("SELECT COUNT(*) c FROM tasks WHERE created_month=?", (month,)).fetchone()["c"]
+            active = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status!=?", (STATUSES["done"],)).fetchone()["c"]
+            in_work = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status=?", (STATUSES["in_progress"],)).fetchone()["c"]
+            rework = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status=?", (STATUSES["rework"],)).fetchone()["c"]
+            creator_rows = conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall()
+
+    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(10)
+    creator_top = Counter()
+    if personal_user:
+        creator_top[personal_user] = created
+    else:
+        for r in creator_rows:
+            creator_top[r["created_by"]] += 1
+
+    return {
+        "month": month,
+        "timezone": TZ_NAME,
+        "scope": "personal" if personal_user else "team",
+        "user": personal_user,
+        "task_ids": [r["id"] for r in rows],
+        "tasks": {
+            "created": created,
+            "completed": total_done,
+            "active": active,
+            "in_work": in_work,
+            "rework": rework,
+        },
+        "deadlines": {
+            "on_time": ontime,
+            "late": late,
+            "late_percent": pct(late, total_done),
+        },
+        "quality": {
+            "good": quality_good,
+            "bad": quality_bad,
+            "bad_percent": pct(quality_bad, total_done),
+        },
+        "efficiency": {
+            "avg_completion_seconds": avg_seconds,
+            "avg_completion": human_duration(avg_seconds),
+        },
+        "top_executors": counter_payload(exec_top),
+        "top_creators": counter_payload(creator_top.most_common(10)),
+    }
+
+
+def report_payload(month: str) -> dict[str, Any]:
+    payload = stats_payload(month)
+    rows = completed_rows(month)
+    per = defaultdict(list)
+    for r in rows:
+        per[r["accepted_by"] or "—"].append(r)
+    performers = sorted(per.items(), key=lambda x: len(x[1]), reverse=True)
+    report_rows = []
+    for name, rs in performers[:10]:
+        avg_seconds = avg_completion(rs)
+        report_rows.append({
+            "name": name,
+            "completed": len(rs),
+            "on_time": sum(1 for r in rs if r["on_time"] == 1),
+            "late": sum(1 for r in rs if r["on_time"] == 0),
+            "quality_bad": sum(1 for r in rs if r["quality_flag"] == 1),
+            "avg_completion_seconds": avg_seconds,
+            "avg_completion": human_duration(avg_seconds),
+        })
+    payload["scope"] = "report"
+    payload["report"] = {
+        "performers": report_rows,
+        "best": report_rows[0] if report_rows else None,
+    }
+    return payload
+
+
+def top_payload(month: str) -> dict[str, Any]:
+    rows = completed_rows(month)
+    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(10)
+    with db() as conn:
+        creators = Counter(r["created_by"] for r in conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall())
+    return {
+        "month": month,
+        "timezone": TZ_NAME,
+        "scope": "top",
+        "top_executors": counter_payload(exec_top),
+        "top_creators": counter_payload(creators.most_common(10)),
+    }
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -468,7 +692,7 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text("❌ Задача не найдена.")
         return
-    completed_at = datetime.now(MSK)
+    completed_at = now_msk()
     deadline = parse_iso_msk(row["deadline"])
     on_time = 1 if completed_at <= deadline else 0
     actor = user_name(update)
@@ -556,14 +780,14 @@ async def taskinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-def stats_text(month: str, personal_user: Optional[str] = None) -> str:
-    rows = completed_rows(month, personal_user)
-    total_done = len(rows)
-    ontime = sum(1 for r in rows if r["on_time"] == 1)
-    late = sum(1 for r in rows if r["on_time"] == 0)
-    quality_bad = sum(1 for r in rows if r["quality_flag"] == 1)
-    quality_good = total_done - quality_bad
-    avg = human_duration(avg_completion(rows))
+def stats_text(month: str, personal_user: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> str:
+    data = payload or stats_payload(month, personal_user)
+    total_done = data["tasks"]["completed"]
+    ontime = data["deadlines"]["on_time"]
+    late = data["deadlines"]["late"]
+    quality_bad = data["quality"]["bad"]
+    quality_good = data["quality"]["good"]
+    avg = data["efficiency"]["avg_completion"]
     if personal_user:
         return f"""
 <b>👤 МОЯ СТАТИСТИКА — {month}</b>
@@ -592,16 +816,12 @@ def stats_text(month: str, personal_user: Optional[str] = None) -> str:
 <b>⚡ Среднее время выполнения</b>
 {avg}
 """.strip()
-    with db() as conn:
-        created = conn.execute("SELECT COUNT(*) c FROM tasks WHERE created_month=?", (month,)).fetchone()["c"]
-        active = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status!='завершена'").fetchone()["c"]
-        in_work = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status='в работе'").fetchone()["c"]
-        rework = conn.execute("SELECT COUNT(*) c FROM tasks WHERE status='на доработке'").fetchone()["c"]
-    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(3)
-    creator_top = Counter()
-    with db() as conn:
-        for r in conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall():
-            creator_top[r["created_by"]] += 1
+    created = data["tasks"]["created"]
+    active = data["tasks"]["active"]
+    in_work = data["tasks"]["in_work"]
+    rework = data["tasks"]["rework"]
+    exec_top = [(item["name"], item["count"]) for item in data["top_executors"][:3]]
+    creator_top = [(item["name"], item["count"]) for item in data["top_creators"][:3]]
     def top_lines(items):
         medals = ["🥇", "🥈", "🥉"]
         return "\n".join(f"{medals[i]} {name} — {count}" for i, (name, count) in enumerate(items)) or "—"
@@ -644,51 +864,59 @@ def stats_text(month: str, personal_user: Optional[str] = None) -> str:
 ━━━━━━━━━━━━━━
 
 <b>📨 Кто ставит больше задач</b>
-{top_lines(creator_top.most_common(3))}
+{top_lines(creator_top)}
 """.strip()
 
 
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.args[0] if context.args else current_month()
-    await update.message.reply_text(stats_text(month), parse_mode=ParseMode.HTML)
+    payload = stats_payload(month)
+    text = stats_text(month, payload=payload)
+    save_stats_snapshot(month, "team_stats", user_name(update), payload, text)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def me_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.args[0] if context.args else current_month()
-    await update.message.reply_text(stats_text(month, user_name(update)), parse_mode=ParseMode.HTML)
+    me = user_name(update)
+    payload = stats_payload(month, me)
+    text = stats_text(month, me, payload)
+    save_stats_snapshot(month, "personal_stats", me, payload, text)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
-def report_text(month: str) -> str:
-    base = stats_text(month)
-    rows = completed_rows(month)
-    per = defaultdict(list)
-    for r in rows:
-        per[r["accepted_by"] or "—"].append(r)
-    performers = sorted(per.items(), key=lambda x: len(x[1]), reverse=True)
+def report_text(month: str, payload: Optional[dict[str, Any]] = None) -> str:
+    data = payload or report_payload(month)
+    base = stats_text(month, payload=data)
+    performers = data["report"]["performers"]
     details = []
     medals = ["🥇", "🥈", "🥉"]
-    for i, (name, rs) in enumerate(performers[:10]):
-        details.append(f"{medals[i] if i < 3 else '•'} {name} — {len(rs)} задач\n• В срок: {sum(1 for r in rs if r['on_time']==1)}\n• Просрочек: {sum(1 for r in rs if r['on_time']==0)}\n• С правками более 3: {sum(1 for r in rs if r['quality_flag']==1)}\n• Среднее время: {human_duration(avg_completion(rs))}")
-    best = performers[0][0] if performers else "—"
-    best_count = len(performers[0][1]) if performers else 0
+    for i, item in enumerate(performers[:10]):
+        details.append(f"{medals[i] if i < 3 else '•'} {item['name']} — {item['completed']} задач\n• В срок: {item['on_time']}\n• Просрочек: {item['late']}\n• С правками более 3: {item['quality_bad']}\n• Среднее время: {item['avg_completion']}")
+    best_item = data["report"]["best"]
+    best = best_item["name"] if best_item else "—"
+    best_count = best_item["completed"] if best_item else 0
     return base.replace("<b>📊 СТАТИСТИКА", "<b>📈 ОТЧЁТ") + f"\n\n━━━━━━━━━━━━━━\n\n<b>👨‍🎨 Исполнители</b>\n" + ("\n\n".join(details) or "—") + f"\n\n━━━━━━━━━━━━━━\n\n<b>🏆 Лучший исполнитель месяца</b>\n{best} — {best_count} выполненных задач."
 
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.args[0] if context.args else current_month()
-    await update.message.reply_text(report_text(month), parse_mode=ParseMode.HTML)
+    payload = report_payload(month)
+    text = report_text(month, payload)
+    save_stats_snapshot(month, "report", user_name(update), payload, text)
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.args[0] if context.args else current_month()
-    rows = completed_rows(month)
-    exec_top = Counter(r["accepted_by"] or "—" for r in rows).most_common(10)
-    with db() as conn:
-        creators = Counter(r["created_by"] for r in conn.execute("SELECT created_by FROM tasks WHERE created_month=?", (month,)).fetchall())
+    payload = top_payload(month)
+    exec_top = [(item["name"], item["count"]) for item in payload["top_executors"]]
+    creators = [(item["name"], item["count"]) for item in payload["top_creators"]]
     medals = ["🥇", "🥈", "🥉"]
     def lines(items):
         return "\n".join(f"{medals[i] if i < 3 else '•'} {n} — {c}" for i, (n, c) in enumerate(items)) or "—"
-    text = f"<b>🏆 РЕЙТИНГ — {month}</b>\n\n━━━━━━━━━━━━━━\n\n<b>👨‍🎨 Исполнители</b>\n{lines(exec_top)}\n\n━━━━━━━━━━━━━━\n\n<b>📨 Постановщики</b>\n{lines(creators.most_common(10))}"
+    text = f"<b>🏆 РЕЙТИНГ — {month}</b>\n\n━━━━━━━━━━━━━━\n\n<b>👨‍🎨 Исполнители</b>\n{lines(exec_top)}\n\n━━━━━━━━━━━━━━\n\n<b>📨 Постановщики</b>\n{lines(creators)}"
+    save_stats_snapshot(month, "top", user_name(update), payload, text)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -767,7 +995,7 @@ async def setshiftstart_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        d = parse_date(context.args[0]) if context.args else datetime.now(MSK).date()
+        d = parse_date(context.args[0]) if context.args else now_msk().date()
     except ValueError:
         await update.message.reply_text("❌ Дата нужна в формате: 05.08.2026")
         return
@@ -789,7 +1017,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def week_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    start = datetime.now(MSK).date()
+    start = now_msk().date()
     lines = ["<b>📅 ГРАФИК НА 7 ДНЕЙ</b>", "━━━━━━━━━━━━━━"]
     for i in range(7):
         d = start + timedelta(days=i)
@@ -881,7 +1109,7 @@ async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
-    if datetime.now(MSK).day != 1:
+    if now_msk().day != 1:
         return
     month = previous_month()
     with db() as conn:
@@ -893,11 +1121,28 @@ async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
         return
     topic = get_setting(f"reports_topic:{chat_id}")
     try:
-        await context.bot.send_message(chat_id=int(chat_id), message_thread_id=int(topic) if topic else None, text=report_text(month), parse_mode=ParseMode.HTML)
+        payload = report_payload(month)
+        text = report_text(month, payload)
+        await context.bot.send_message(chat_id=int(chat_id), message_thread_id=int(topic) if topic else None, text=text, parse_mode=ParseMode.HTML)
+        save_stats_snapshot(month, "monthly_report", "system", payload, text)
         with db() as conn:
             conn.execute("INSERT INTO monthly_reports(month,sent_at) VALUES(?,?)", (month, now_iso()))
     except Exception as e:
         logger.warning("Monthly report failed: %s", e)
+
+
+def logged_command_handler(name: str, fn) -> CommandHandler:
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        started_at = now_msk()
+        action_id = log_command_start(name, update, context)
+        try:
+            await fn(update, context)
+        except Exception as e:
+            finish_command_log(action_id, "error", started_at, repr(e))
+            raise
+        finish_command_log(action_id, "ok", started_at)
+
+    return CommandHandler(name, wrapped)
 
 
 def main() -> None:
@@ -917,7 +1162,10 @@ def main() -> None:
         ("fixquality", fixquality_cmd), ("fixdeadline", fixdeadline_cmd),
     ]
     for name, fn in handlers:
-        app.add_handler(CommandHandler(name, fn))
+        app.add_handler(logged_command_handler(name, fn))
+    if not app.job_queue:
+        raise RuntimeError("JobQueue не найден. Установите python-telegram-bot с поддержкой job-queue.")
+    app.job_queue.scheduler.configure(timezone=MSK)
     app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
