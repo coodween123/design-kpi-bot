@@ -24,6 +24,11 @@ try:
 except ImportError:
     MessageReactionHandler = None
 
+try:
+    from telegram import ReactionTypeEmoji
+except ImportError:
+    ReactionTypeEmoji = None
+
 APP_HOME = Path(os.getenv("DESIGN_KPI_HOME", Path.home() / "Documents" / "design-kpi-bot")).expanduser()
 DATA_DIR = Path(os.getenv("DATA_DIR", APP_HOME / "data")).expanduser()
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", APP_HOME / "backups")).expanduser()
@@ -93,6 +98,10 @@ DATETIME_FMT = "%d.%m.%Y %H:%M"
 TZ_NAME = "Europe/Moscow"
 MSK = ZoneInfo(TZ_NAME)
 MAX_TASK_TITLE_WORDS = 8
+ALLOWED_UPDATES = list(getattr(Update, "ALL_TYPES", []))
+for update_type in ("message_reaction", "message_reaction_count"):
+    if update_type not in ALLOWED_UPDATES:
+        ALLOWED_UPDATES.append(update_type)
 STATUSES = {
     "waiting": "ожидает принятия",
     "in_progress": "в работе",
@@ -722,6 +731,67 @@ def task_source_link(task_id: int) -> Optional[str]:
     if not row:
         return None
     return message_link(row["chat_id"], row["message_id"])
+
+
+def task_accept_log_text(row, task_id: int, executor: str, command_link: Optional[str] = None) -> str:
+    source = task_source_link(task_id)
+    task_ref = (
+        f'<a href="{html.escape(source, quote=True)}">задачу #{task_id}</a>'
+        if source
+        else f"задачу #{task_id}"
+    )
+    lines = [
+        "<b>🔵 Дизайнер принял задачу</b>",
+        f"Исполнитель: {html.escape(executor)}",
+        f"Принял: {task_ref}",
+        f"Название: {html.escape(row['title'])}",
+        f"Постановщик: {html.escape(row['created_by'])}",
+        f"Дедлайн: {fmt_dt(row['deadline'])}",
+    ]
+    if command_link:
+        lines.append(f'Команда /ok: <a href="{html.escape(command_link, quote=True)}">открыть сообщение</a>')
+    return "\n".join(lines)
+
+
+async def react_to_message(context: ContextTypes.DEFAULT_TYPE, message, emoji: str = "👍") -> bool:
+    if not message or not hasattr(context.bot, "set_message_reaction"):
+        return False
+
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
+    if chat_id is None or message_id is None:
+        return False
+
+    payloads = []
+    if ReactionTypeEmoji:
+        payloads.append([ReactionTypeEmoji(emoji)])
+    payloads.extend([
+        [{"type": "emoji", "emoji": emoji}],
+        [emoji],
+        emoji,
+    ])
+
+    last_error = None
+    for payload in payloads:
+        try:
+            await context.bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=message_id,
+                reaction=payload,
+                is_big=False,
+            )
+            return True
+        except TypeError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            logger.warning("Cannot set reaction on message %s/%s: %s", chat_id, message_id, e)
+            return False
+
+    if last_error:
+        logger.warning("Cannot set reaction on message %s/%s: %s", chat_id, message_id, last_error)
+    return False
 
 
 def is_active_designer(username: str) -> bool:
@@ -1650,28 +1720,54 @@ async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     executor = user_name(update)
     with db() as conn:
         conn.execute("UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?", (executor, now_iso(), STATUSES["in_progress"], task_id))
-    log_action(task_id, "accept", executor, "", row["status"], STATUSES["in_progress"])
-    await send_log(context, update.effective_chat.id, f"<b>🔵 Задача #{task_id} принята</b>\nИсполнитель: {html.escape(executor)}")
+    remember_task_message(task_id, update.message, "ok_command")
+    command_link = message_link(update.effective_chat.id, update.message.message_id)
+    log_action(task_id, "accept", executor, f"ok_message_id={update.message.message_id}", row["status"], STATUSES["in_progress"])
+    await react_to_message(context, update.message)
+    await send_log(context, update.effective_chat.id, task_accept_log_text(row, task_id, executor, command_link))
 
 
 async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reaction = getattr(update, "message_reaction", None)
-    if not reaction or not reaction.new_reaction:
-        return
-    if not reaction.user:
+    if not reaction or not getattr(reaction, "new_reaction", None):
         return
 
-    executor = user_name_from_user(reaction.user)
-    if not is_active_designer(executor):
+    chat = getattr(reaction, "chat", None)
+    chat_id = getattr(chat, "id", None) or getattr(reaction, "chat_id", None)
+    message_id = getattr(reaction, "message_id", None)
+    if chat_id is None or message_id is None:
+        logger.warning("Reaction update without chat_id/message_id: %s", reaction)
         return
 
-    message_link = task_message_by_reaction(reaction.chat.id, reaction.message_id)
+    message_link = task_message_by_reaction(chat_id, message_id)
     if not message_link:
         return
 
     task_id = message_link["task_id"]
     row = task_by_id(task_id)
-    if not row or row["status"] != STATUSES["waiting"] or row["accepted_by"]:
+    if not row:
+        log_action(task_id, "reaction_ignored", "system", "task not found")
+        return
+
+    user = getattr(reaction, "user", None)
+    if not user:
+        log_action(task_id, "reaction_ignored", "unknown", "reaction has no user", row["status"], row["status"])
+        return
+
+    executor = user_name_from_user(user)
+    if not is_active_designer(executor):
+        log_action(task_id, "reaction_ignored", executor, "user is not an active designer", row["status"], row["status"])
+        return
+
+    if row["status"] != STATUSES["waiting"] or row["accepted_by"]:
+        log_action(
+            task_id,
+            "reaction_ignored",
+            executor,
+            f"task already accepted or not waiting; accepted_by={row['accepted_by'] or '—'}",
+            row["status"],
+            row["status"],
+        )
         return
 
     accepted_at = now_iso()
@@ -1680,10 +1776,10 @@ async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             "UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?",
             (executor, accepted_at, STATUSES["in_progress"], task_id),
         )
-    log_action(task_id, "accept_reaction", executor, f"reaction_message_id={reaction.message_id}", row["status"], STATUSES["in_progress"])
+    log_action(task_id, "accept_reaction", executor, f"reaction_message_id={message_id}", row["status"], STATUSES["in_progress"])
 
-    text = f"<b>🔵 Задача #{task_id} принята реакцией</b>\nИсполнитель: {html.escape(executor)}"
-    await send_log(context, reaction.chat.id, text)
+    text = task_accept_log_text(row, task_id, executor)
+    await send_log(context, int(chat_id), text)
 
 
 async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2553,7 +2649,7 @@ def main() -> None:
     app.job_queue.run_daily(auto_shift_reassign_job, time=dt_time(hour=0, minute=0, tzinfo=MSK))
     app.job_queue.run_daily(daily_tasks_job, time=dt_time(hour=9, minute=0, tzinfo=MSK))
     app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
 if __name__ == "__main__":
