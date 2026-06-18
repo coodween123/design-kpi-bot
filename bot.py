@@ -1423,6 +1423,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(help_text("🔷 МЕНЮ КОМАНД", MAIN_HELP_COMMANDS), parse_mode=ParseMode.HTML)
 
 async def setup_commands(app: Application):
+    await app.bot.delete_my_commands()
     await app.bot.set_my_commands([
         BotCommand("help", "меню команд"),
         BotCommand("task", "(дата/время) (описание)"),
