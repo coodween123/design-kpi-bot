@@ -98,6 +98,7 @@ DATETIME_FMT = "%d.%m.%Y %H:%M"
 TZ_NAME = "Europe/Moscow"
 MSK = ZoneInfo(TZ_NAME)
 MAX_TASK_TITLE_WORDS = 8
+CONFIRM_TTL_SECONDS = 15 * 60
 ALLOWED_UPDATES = list(getattr(Update, "ALL_TYPES", []))
 for update_type in ("message_reaction", "message_reaction_count"):
     if update_type not in ALLOWED_UPDATES:
@@ -357,6 +358,7 @@ COMMAND_HELP = {
     "help": "🔷 <code>/help</code> — показать меню команд",
     "task": "🔷 <code>/task (дата/время) (описание)</code> — создать задачу",
     "retask": "🔷 <code>/retask (ID) (дата/время) (описание)</code> — изменить задачу полностью",
+    "deletetask": "🔷 <code>/deletetask (ID)</code> — удалить задачу из задач, истории и статистики",
     "ok": "🔷 <code>/ok (ID)</code> — принять задачу в работу",
     "done": "🔷 <code>/done (ID) (0/1)</code> — завершить задачу: 0 до 3 правок, 1 больше 3 правок",
     "reassign": "🔷 <code>/reassign (ID) (@username)</code> — переназначить исполнителя",
@@ -385,7 +387,7 @@ COMMAND_HELP = {
 }
 
 MAIN_HELP_COMMANDS = [
-    "help", "task", "retask", "ok", "done", "reassign", "rework", "tasks",
+    "help", "task", "retask", "deletetask", "ok", "done", "reassign", "rework", "tasks",
     "note", "stats", "report", "top", "history", "online", "time", "sobranie",
     "backup", "storage", "add", "remove", "designers", "smena", "swap", "clearswap",
     "setreport", "setdaily", "fixquality", "fixdeadline",
@@ -393,7 +395,7 @@ MAIN_HELP_COMMANDS = [
 
 HELP_GROUPS = [
     ("Основное", ["help", "time", "sobranie"]),
-    ("Задачи", ["task", "retask", "ok", "done", "reassign", "rework", "tasks", "note"]),
+    ("Задачи", ["task", "retask", "deletetask", "ok", "done", "reassign", "rework", "tasks", "note"]),
     ("Статистика", ["stats", "report", "top", "history"]),
     ("График", ["online", "designers", "smena", "swap", "clearswap"]),
     ("Настройки", ["backup", "storage", "add", "remove", "setreport", "setdaily", "fixquality", "fixdeadline"]),
@@ -631,6 +633,96 @@ def get_setting(key: str) -> Optional[str]:
     with db() as conn:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
+
+
+def cleanup_counts() -> dict[str, int]:
+    tables = [
+        "settings",
+        "tasks",
+        "task_log",
+        "bot_actions",
+        "task_messages",
+        "deadline_alerts",
+        "chat_messages",
+        "stats_snapshots",
+        "shift_overrides",
+        "monthly_reports",
+        "meetings",
+        "daily_notes",
+    ]
+    with db() as conn:
+        return {table: conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"] for table in tables}
+
+
+def delete_task_everywhere(task_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute("SELECT id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute("DELETE FROM deadline_alerts WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM task_messages WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM task_log WHERE task_id=?", (task_id,))
+        conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
+        conn.execute("DELETE FROM stats_snapshots")
+        return True
+
+
+def clear_tasks_and_stats() -> dict[str, int]:
+    counts = cleanup_counts()
+    with db() as conn:
+        conn.execute("DELETE FROM settings")
+        conn.execute("DELETE FROM deadline_alerts")
+        conn.execute("DELETE FROM task_messages")
+        conn.execute("DELETE FROM task_log")
+        conn.execute("DELETE FROM tasks")
+        conn.execute("DELETE FROM bot_actions")
+        conn.execute("DELETE FROM chat_messages")
+        conn.execute("DELETE FROM stats_snapshots")
+        conn.execute("DELETE FROM shift_overrides")
+        conn.execute("DELETE FROM monthly_reports")
+        conn.execute("DELETE FROM meetings")
+        conn.execute("DELETE FROM daily_notes")
+        conn.execute("DELETE FROM sqlite_sequence WHERE name!='designers'")
+    return counts
+
+
+def remember_confirmation(context: ContextTypes.DEFAULT_TYPE, update: Update, message, action: str, payload: dict[str, Any]) -> None:
+    context.user_data["pending_confirmation"] = {
+        "action": action,
+        "payload": payload,
+        "chat_id": update.effective_chat.id,
+        "message_id": message.message_id,
+        "expires_at": (now_msk() + timedelta(seconds=CONFIRM_TTL_SECONDS)).isoformat(timespec="seconds"),
+    }
+
+
+def take_confirmation(context: ContextTypes.DEFAULT_TYPE, update: Update) -> tuple[Optional[dict[str, Any]], str]:
+    pending = context.user_data.get("pending_confirmation")
+    if not pending:
+        return None, "missing"
+    if pending.get("chat_id") != update.effective_chat.id:
+        return None, "wrong_chat"
+    reply = getattr(update.message, "reply_to_message", None)
+    if not reply or reply.message_id != pending.get("message_id"):
+        return None, "not_reply"
+    if parse_iso_msk(pending["expires_at"]) < now_msk():
+        context.user_data.pop("pending_confirmation", None)
+        return pending, "expired"
+    context.user_data.pop("pending_confirmation", None)
+    return pending, "ok"
+
+
+async def edit_confirmation(context: ContextTypes.DEFAULT_TYPE, update: Update, pending: dict[str, Any], text: str, parse_mode: Optional[str] = None) -> None:
+    try:
+        await context.bot.edit_message_text(
+            chat_id=pending["chat_id"],
+            message_id=pending["message_id"],
+            text=text,
+            parse_mode=parse_mode,
+        )
+    except Exception as e:
+        logger.warning("Cannot edit confirmation message: %s", e)
+        await update.message.reply_text(text, parse_mode=parse_mode)
 
 
 def log_action(task_id: Optional[int], action: str, user: str, comment: str = "", old_status: str = "", new_status: str = "") -> None:
@@ -1428,6 +1520,7 @@ async def setup_commands(app: Application):
         BotCommand("help", "меню команд"),
         BotCommand("task", "(дата/время) (описание)"),
         BotCommand("retask", "(ID) (дата/время) (описание)"),
+        BotCommand("deletetask", "(ID) удалить задачу"),
         BotCommand("ok", "(ID) принять задачу"),
         BotCommand("done", "(ID) (0/1) завершить задачу"),
         BotCommand("reassign", "(ID) (@username) переназначить"),
@@ -1653,6 +1746,131 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Дедлайн: {new_deadline.strftime(DATETIME_FMT)}"
         f"{deadline_status}"
     )
+
+
+async def deletetask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args or not context.args[0].isdigit():
+        await update.message.reply_text(command_usage("deletetask"), parse_mode=ParseMode.HTML)
+        return
+    task_id = int(context.args[0])
+    row = task_by_id(task_id)
+    if not row:
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
+        return
+
+    question = await update.message.reply_text(
+        f"<b>Удалить задачу #{task_id}?</b>\n\n"
+        f"Статус: {html.escape(row['status'])}\n"
+        f"Дедлайн: {fmt_dt(row['deadline'])}\n"
+        f"Постановщик: {html.escape(row['created_by'])}\n"
+        f"Исполнитель: {html.escape(row['accepted_by'] or '—')}\n\n"
+        f"После подтверждения задача пропадет из активных задач, истории и статистики.\n\n"
+        f"<b>Важно:</b> действие нельзя будет отменить.\n\n"
+        f"Ответьте на это сообщение:\n"
+        f"<code>/yes</code> — удалить\n"
+        f"<code>/no</code> — оставить как есть",
+        parse_mode=ParseMode.HTML,
+    )
+    remember_confirmation(
+        context,
+        update,
+        question,
+        "delete_task",
+        {"task_id": task_id, "title": row["title"], "status": row["status"]},
+    )
+
+
+async def resetall_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    counts = cleanup_counts()
+    question = await update.message.reply_text(
+        f"<b>Очистить все задачи и статистику?</b>\n\n"
+        f"База станет как после нового запуска бота.\n"
+        f"Останется только список дизайнеров.\n"
+        f"Задачи, история, рейтинги, отчеты, график смен, собрания, комментарии и настройки чатов будут очищены.\n"
+        f"/setdaily и /setreport после этого нужно будет назначить заново.\n\n"
+        f"Сейчас в базе:\n"
+        f"Задач: {counts['tasks']}\n"
+        f"Записей истории: {counts['task_log']}\n"
+        f"Настроек: {counts['settings']}\n"
+        f"Сообщений для рейтинга молчунов: {counts['chat_messages']}\n\n"
+        f"<b>Важно:</b> действие нельзя будет отменить.\n\n"
+        f"Ответьте на это сообщение:\n"
+        f"<code>/yes</code> — очистить\n"
+        f"<code>/no</code> — оставить как есть",
+        parse_mode=ParseMode.HTML,
+    )
+    remember_confirmation(context, update, question, "reset_all", counts)
+
+
+async def yes_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending, status = take_confirmation(context, update)
+    if status == "missing":
+        await update.message.reply_text("Сейчас нет действия, которое ждет подтверждения.")
+        return
+    if status == "wrong_chat":
+        await update.message.reply_text("Подтверждение нужно отправить в том же чате, где был вопрос.")
+        return
+    if status == "not_reply":
+        await update.message.reply_text("Чтобы подтвердить, ответьте /yes именно на сообщение с вопросом.")
+        return
+    if status == "expired":
+        await edit_confirmation(context, update, pending, "Время подтверждения вышло. Ничего не удалено.")
+        return
+
+    action = pending["action"]
+    payload = pending["payload"]
+    if action == "delete_task":
+        task_id = int(payload["task_id"])
+        deleted = delete_task_everywhere(task_id)
+        if deleted:
+            await edit_confirmation(
+                context,
+                update,
+                pending,
+                f"Готово, задача #{task_id} удалена из задач, истории и статистики.",
+            )
+        else:
+            await edit_confirmation(context, update, pending, f"Задача #{task_id} уже не найдена. Удалять нечего.")
+        return
+
+    if action == "reset_all":
+        counts = clear_tasks_and_stats()
+        await edit_confirmation(
+            context,
+            update,
+            pending,
+            "Готово, база очищена почти с нуля.\n"
+            f"Удалено задач: {counts['tasks']}.\n"
+            "Список дизайнеров сохранен.\n"
+            "Нумерация задач сброшена. Следующая задача будет #1.\n"
+            "Не забудьте заново назначить /setdaily и /setreport, если они нужны.",
+        )
+        return
+
+    await edit_confirmation(context, update, pending, "Не смог понять, какое действие подтверждать. Ничего не удалено.")
+
+
+async def no_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pending, status = take_confirmation(context, update)
+    if status == "missing":
+        await update.message.reply_text("Сейчас нет действия, которое нужно отменить.")
+        return
+    if status == "wrong_chat":
+        await update.message.reply_text("Отмену нужно отправить в том же чате, где был вопрос.")
+        return
+    if status == "not_reply":
+        await update.message.reply_text("Чтобы отменить, ответьте /no именно на сообщение с вопросом.")
+        return
+
+    if pending["action"] == "delete_task":
+        task_id = pending["payload"].get("task_id")
+        await edit_confirmation(context, update, pending, f"Хорошо, задачу #{task_id} не удаляю. Ничего не изменилось.")
+        return
+    if pending["action"] == "reset_all":
+        await edit_confirmation(context, update, pending, "Хорошо, полную очистку отменил. Ничего не удалено.")
+        return
+    await edit_confirmation(context, update, pending, "Хорошо, отменил. Ничего не удалено.")
+
 
 async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].isdigit():
@@ -2534,13 +2752,14 @@ def main() -> None:
     handlers = [
         ("start", start), ("help", help_cmd), ("time", time_cmd), ("sobranie", sobranie_cmd),
         ("backup", backup_cmd), ("storage", storage_cmd),
-        ("task", task_cmd), ("retask", retask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
+        ("task", task_cmd), ("retask", retask_cmd), ("deletetask", deletetask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
         ("tasks", tasks_cmd), ("note", note_cmd),
         ("stats", stats_cmd), ("report", report_cmd), ("top", top_cmd), ("history", history_cmd),
         ("add", add_cmd), ("remove", remove_cmd), ("designers", designers_cmd),
         ("smena", smena_cmd), ("online", online_cmd), ("swap", swap_cmd), ("clearswap", clearswap_cmd),
         ("setreport", setreport_cmd), ("setdaily", setdaily_cmd),
         ("fixquality", fixquality_cmd), ("fixdeadline", fixdeadline_cmd),
+        ("resetall", resetall_cmd), ("yes", yes_cmd), ("no", no_cmd),
     ]
     for name, fn in handlers:
         app.add_handler(logged_command_handler(name, fn))
