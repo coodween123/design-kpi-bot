@@ -1125,20 +1125,29 @@ def report_payload(month: str) -> dict[str, Any]:
     overall_avg_seconds = avg_completion(rows)
     per = defaultdict(list)
     for r in rows:
-        per[r["accepted_by"] or "—"].append(r)
-    performers = sorted(per.items(), key=lambda x: len(x[1]), reverse=True)
+        per[task_designer(r)].append(r)
+    performer_names = sorted(set(active_designers()) | set(per.keys()), key=user_key)
     report_rows = []
-    for name, rs in performers[:10]:
+    for name in performer_names:
+        rs = per.get(name, [])
         performer_avg_seconds = avg_completion(rs)
+        total = len(rs)
+        on_time = sum(1 for r in rs if r["on_time"] == 1)
+        late_count = sum(1 for r in rs if r["on_time"] == 0)
+        quality_bad = sum(1 for r in rs if r["quality_flag"] == 1)
         report_rows.append({
             "name": name,
-            "completed": len(rs),
-            "on_time": sum(1 for r in rs if r["on_time"] == 1),
-            "late": sum(1 for r in rs if r["on_time"] == 0),
-            "quality_bad": sum(1 for r in rs if r["quality_flag"] == 1),
+            "completed": total,
+            "on_time": on_time,
+            "on_time_percent": pct(on_time, total),
+            "late": late_count,
+            "quality_bad": quality_bad,
+            "quality_bad_percent": pct(quality_bad, total),
             "avg_completion_seconds": performer_avg_seconds,
             "avg_completion": human_duration(performer_avg_seconds),
         })
+    report_rows.sort(key=lambda item: (-item["completed"], item["name"]))
+    best = next((item for item in report_rows if item["completed"] > 0), None)
     payload["scope"] = "report"
     payload["summary"] = {
         "completed": len(rows),
@@ -1151,71 +1160,36 @@ def report_payload(month: str) -> dict[str, Any]:
     }
     payload["report"] = {
         "performers": report_rows,
-        "best": report_rows[0] if report_rows else None,
+        "best": best,
     }
     return payload
 
 
-REPORT_SUMMARY_FIELDS = [
+REPORT_DESIGNER_FIELDS = [
     "Месяц",
-    "Выполнено задач",
-    "Задач отправлено на исправление",
-    "% задач с исправлениями",
+    "Дизайнер",
+    "Сделано задач",
     "Просрочено задач",
-    "% задач с просрочкой",
-    "Среднее время выполнения, минут",
-]
-
-REPORT_TASK_FIELDS = [
-    "ID",
-    "Постановщик",
-    "Исполнитель",
-    "Создана",
-    "Принята",
-    "Завершена",
-    "Дедлайн",
-    "Просрочена",
-    "Исправлений",
-    "Время выполнения, минут",
-    "Описание",
+    "Задач было исправлено (больше 3 правок)",
+    "% Выполнение задач в срок",
+    "% Качество работы (работ больше 3 правок)",
 ]
 
 
-def task_completion_minutes(row) -> str:
-    if not row["completed_at"]:
-        return "—"
-    start = row["accepted_at"] or row["created_at"]
-    seconds = (parse_iso_msk(row["completed_at"]) - parse_iso_msk(start)).total_seconds()
-    return f"{seconds / 60:.2f}"
-
-
-def report_summary_records(month: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
-    summary = payload["summary"]
-    return [{
+def report_designer_record(month: str, designer: str, rows) -> dict[str, Any]:
+    total = len(rows)
+    on_time = sum(1 for row in rows if row["on_time"] == 1)
+    late = sum(1 for row in rows if row["on_time"] == 0)
+    quality_bad = sum(1 for row in rows if row["quality_flag"] == 1)
+    return {
         "Месяц": month,
-        "Выполнено задач": summary["completed"],
-        "Задач отправлено на исправление": summary["rework_tasks"],
-        "% задач с исправлениями": summary["rework_percent"],
-        "Просрочено задач": summary["late"],
-        "% задач с просрочкой": summary["late_percent"],
-        "Среднее время выполнения, минут": summary["avg_completion_minutes"],
-    }]
-
-
-def report_task_records(rows) -> list[dict[str, Any]]:
-    return [{
-        "ID": row["id"],
-        "Постановщик": row["created_by"],
-        "Исполнитель": task_designer(row),
-        "Создана": fmt_dt(row["created_at"]),
-        "Принята": fmt_dt(row["accepted_at"]),
-        "Завершена": fmt_dt(row["completed_at"]),
-        "Дедлайн": fmt_dt(row["deadline"]),
-        "Просрочена": "да" if row["on_time"] == 0 else "нет",
-        "Исправлений": row["rework_count"],
-        "Время выполнения, минут": task_completion_minutes(row),
-        "Описание": row["description"] or "",
-    } for row in rows]
+        "Дизайнер": designer,
+        "Сделано задач": total,
+        "Просрочено задач": late,
+        "Задач было исправлено (больше 3 правок)": quality_bad,
+        "% Выполнение задач в срок": pct(on_time, total),
+        "% Качество работы (работ больше 3 правок)": pct(quality_bad, total),
+    }
 
 
 def report_summary_text(month: str, payload: dict[str, Any]) -> str:
@@ -1244,9 +1218,14 @@ def build_report_zip(month: str, payload: dict[str, Any], rows) -> tuple[bytes, 
     period = month.replace(".", "-")
     filename = f"design_kpi_report_{period}.zip"
     archive = io.BytesIO()
+    by_designer = defaultdict(list)
+    for row in rows:
+        by_designer[task_designer(row)].append(row)
+    designer_names = sorted(set(active_designers()) | set(by_designer.keys()), key=user_key)
     with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.writestr("summary.csv", csv_bytes(report_summary_records(month, payload), REPORT_SUMMARY_FIELDS))
-        zf.writestr("tasks.csv", csv_bytes(report_task_records(rows), REPORT_TASK_FIELDS))
+        for designer in designer_names:
+            record = report_designer_record(month, designer, by_designer.get(designer, []))
+            zf.writestr(f"designer_{safe_filename_part(designer)}.csv", csv_bytes([record], REPORT_DESIGNER_FIELDS))
     archive.seek(0)
     return archive.getvalue(), filename
 
