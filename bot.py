@@ -733,26 +733,6 @@ def task_source_link(task_id: int) -> Optional[str]:
     return message_link(row["chat_id"], row["message_id"])
 
 
-def task_accept_log_text(row, task_id: int, executor: str, command_link: Optional[str] = None) -> str:
-    source = task_source_link(task_id)
-    task_ref = (
-        f'<a href="{html.escape(source, quote=True)}">задачу #{task_id}</a>'
-        if source
-        else f"задачу #{task_id}"
-    )
-    lines = [
-        "<b>🔵 Дизайнер принял задачу</b>",
-        f"Исполнитель: {html.escape(executor)}",
-        f"Принял: {task_ref}",
-        f"Название: {html.escape(row['title'])}",
-        f"Постановщик: {html.escape(row['created_by'])}",
-        f"Дедлайн: {fmt_dt(row['deadline'])}",
-    ]
-    if command_link:
-        lines.append(f'Команда /ok: <a href="{html.escape(command_link, quote=True)}">открыть сообщение</a>')
-    return "\n".join(lines)
-
-
 async def react_to_message(context: ContextTypes.DEFAULT_TYPE, message, emoji: str = "👍") -> bool:
     if not message or not hasattr(context.bot, "set_message_reaction"):
         return False
@@ -1721,10 +1701,8 @@ async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?", (executor, now_iso(), STATUSES["in_progress"], task_id))
     remember_task_message(task_id, update.message, "ok_command")
-    command_link = message_link(update.effective_chat.id, update.message.message_id)
     log_action(task_id, "accept", executor, f"ok_message_id={update.message.message_id}", row["status"], STATUSES["in_progress"])
     await react_to_message(context, update.message)
-    await send_log(context, update.effective_chat.id, task_accept_log_text(row, task_id, executor, command_link))
 
 
 async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1777,9 +1755,6 @@ async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
             (executor, accepted_at, STATUSES["in_progress"], task_id),
         )
     log_action(task_id, "accept_reaction", executor, f"reaction_message_id={message_id}", row["status"], STATUSES["in_progress"])
-
-    text = task_accept_log_text(row, task_id, executor)
-    await send_log(context, int(chat_id), text)
 
 
 async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
