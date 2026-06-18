@@ -74,26 +74,58 @@ def parse_dt(value: str) -> datetime:
     return datetime.strptime(value.strip(), DATETIME_FMT).replace(tzinfo=MSK)
 
 
-TASK_BODY_RE = re.compile(r"^\s*(?P<title>.+?)\s+(?P<date>\d{2}\.\d{2}\.\d{4})\s+(?P<time>\d{2}:\d{2})\s+(?P<desc>.+?)\s*$")
+DATE_TOKEN_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4},?$")
+TIME_TOKEN_RE = re.compile(r"^\d{2}:\d{2},?$")
 
 
-def parse_task_body(raw: str) -> tuple[Optional[str], Optional[datetime], Optional[str], Optional[str]]:
-    if "," in raw:
-        return None, None, None, "Пишите без запятых."
-    match = TASK_BODY_RE.match(raw)
-    if not match:
-        return None, None, None, "Неверный формат."
-    title = match.group("title").strip()
-    desc = match.group("desc").strip()
-    if not title or not desc:
-        return None, None, None, "Заполните название, дату, время и описание."
-    if len(title.split()) > MAX_TASK_TITLE_WORDS:
-        return None, None, None, f"Название задачи — максимум {MAX_TASK_TITLE_WORDS} слов."
+def clean_dt_token(value: str) -> str:
+    return value.strip().rstrip(",")
+
+
+def parse_flexible_datetime_tokens(tokens: list[str]) -> tuple[Optional[datetime], int, Optional[str]]:
+    if not tokens:
+        return None, 0, "Укажите дату, время или дату и время."
+    first = clean_dt_token(tokens[0])
     try:
-        deadline = parse_dt(f"{match.group('date')} {match.group('time')}")
+        if DATE_TOKEN_RE.fullmatch(tokens[0].strip()):
+            d = parse_date(first)
+            if len(tokens) > 1 and TIME_TOKEN_RE.fullmatch(tokens[1].strip()):
+                t = datetime.strptime(clean_dt_token(tokens[1]), "%H:%M").time()
+                consumed = 2
+            else:
+                t = dt_time(hour=23, minute=59)
+                consumed = 1
+            return datetime.combine(d, t, tzinfo=MSK), consumed, None
+        if TIME_TOKEN_RE.fullmatch(tokens[0].strip()):
+            t = datetime.strptime(first, "%H:%M").time()
+            return datetime.combine(now_msk().date(), t, tzinfo=MSK), 1, None
     except ValueError:
-        return None, None, None, "Дедлайн нужен в формате: 31.07.2026 18:00"
-    return title, deadline, desc, None
+        return None, 0, "Дата или время указаны неверно."
+    return None, 0, "Дата нужна в формате 31.07.2026, время — 18:00."
+
+
+def parse_datetime_and_text(raw: str, need_text: bool = True) -> tuple[Optional[datetime], str, Optional[str]]:
+    tokens = raw.strip().split()
+    deadline, consumed, error = parse_flexible_datetime_tokens(tokens)
+    if error:
+        return None, "", error
+    text = " ".join(tokens[consumed:]).strip()
+    if need_text and not text:
+        return None, "", "Добавьте текст после даты или времени."
+    return deadline, text, None
+
+
+def make_task_title(desc: str) -> str:
+    words = desc.strip().split()
+    title = " ".join(words[:MAX_TASK_TITLE_WORDS]) or "Задача"
+    return title[:80]
+
+
+def short_text(text: str, limit: int = 260) -> str:
+    clean = " ".join((text or "").split())
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 3].rstrip() + "..."
 
 
 def parse_date(value: str) -> date:
@@ -152,46 +184,54 @@ def html_quote_code(text: str) -> str:
     return f"<blockquote><code>{html.escape(text)}</code></blockquote>"
 
 
+def html_note_quote(text: str, limit: int = 1400) -> str:
+    clean = (text or "").strip()
+    if len(clean) > limit:
+        clean = clean[: limit - 3].rstrip() + "..."
+    return f"<blockquote>{html.escape(clean)}</blockquote>"
+
+
 COMMAND_HELP = {
-    "help": "🔷 /help — показать меню команд",
-    "task": f"🔷 /task (задача до {MAX_TASK_TITLE_WORDS} слов) (дата) (время) (описание) — создать задачу",
-    "retask": f"🔷 /retask (ID) (задача до {MAX_TASK_TITLE_WORDS} слов) (дата) (время) (описание) — изменить задачу полностью",
-    "ok": "🔷 /ok (ID) — принять задачу в работу",
-    "done": "🔷 /done (ID) (0/1) — завершить задачу: 0 до 3 правок, 1 больше 3 правок",
-    "reassign": "🔷 /reassign (ID) (@username) — переназначить исполнителя",
-    "rework": "🔷 /rework (ID) (дата) (время) (причина) — отправить задачу на доработку с новым дедлайном",
-    "tasks": "🔷 /tasks — показать активные задачи",
-    "stats": "🔷 /stats (месяц.год) (@username) — показать статистику: без параметров вся команда за всё время, с ником конкретный человек",
-    "report": "🔷 /report (месяц) — показать месячный отчет; месяц можно не писать",
-    "month_report": "🔷 /month_report (месяц) — показать месячный отчет; месяц можно не писать",
-    "top": "🔷 /top (месяц) — показать месячные номинации; месяц можно не писать",
-    "history": "🔷 /history (месяц/all) (@designer) — скачать историю выполненных задач; параметры можно не писать",
-    "online": "🔷 /online (дд.мм.гггг или мм.гггг или week) — показать кто работает сегодня, в конкретный день, за месяц или за неделю",
-    "time": "🔷 /time — показать текущее время по Москве",
-    "sobranie": "🔷 /sobranie (дата) (время) — запланировать собрание и напоминания",
-    "add": "🔷 /add (@username) — добавить дизайнера",
-    "remove": "🔷 /remove (@username) — убрать дизайнера из активных",
-    "designers": "🔷 /designers — показать активных дизайнеров",
-    "smena": "🔷 /smena (дата) (@designer) — задать старт графика 2/2",
-    "swap": "🔷 /swap (дата) (@designer) (причина) — назначить подмену",
-    "clearswap": "🔷 /clearswap (дата) — отменить подмену",
-    "setlog": "🔷 /setlog — назначить текущую тему логом задач",
-    "setreports": "🔷 /setreports — назначить текущую тему отчетами",
-    "setdaily": "🔷 /setdaily — назначить текущий чат или тему для утренних задач",
-    "fixquality": "🔷 /fixquality (ID) (0/1) — исправить качество: 0 до 3 правок, 1 больше 3 правок",
-    "fixdeadline": "🔷 /fixdeadline (ID) (0/1) — исправить срок: 0 в срок, 1 просрочено",
+    "help": "🔷 <code>/help</code> — показать меню команд",
+    "task": "🔷 <code>/task (дата/время) (описание)</code> — создать задачу",
+    "retask": "🔷 <code>/retask (ID) (дата/время) (описание)</code> — изменить задачу полностью",
+    "ok": "🔷 <code>/ok (ID)</code> — принять задачу в работу",
+    "done": "🔷 <code>/done (ID) (0/1)</code> — завершить задачу: 0 до 3 правок, 1 больше 3 правок",
+    "reassign": "🔷 <code>/reassign (ID) (@username)</code> — переназначить исполнителя",
+    "rework": "🔷 <code>/rework (ID) (дата/время) (причина)</code> — отправить задачу на доработку с новым дедлайном",
+    "tasks": "🔷 <code>/tasks</code> — показать активные задачи",
+    "note": "🔷 <code>/note (комментарий)</code> — оставить комментарий для ближайшей утренней сводки",
+    "stats": "🔷 <code>/stats (месяц.год) (@username)</code> — показать статистику: без параметров вся команда за всё время, с ником конкретный человек",
+    "report": "🔷 <code>/report (месяц)</code> — скачать месячный отчет zip-файлом; месяц можно не писать",
+    "month_report": "🔷 <code>/month_report (месяц)</code> — скачать месячный отчет zip-файлом; месяц можно не писать",
+    "top": "🔷 <code>/top (месяц)</code> — показать месячные номинации; месяц можно не писать",
+    "history": "🔷 <code>/history (месяц/all) (@designer)</code> — скачать историю выполненных задач; параметры можно не писать",
+    "online": "🔷 <code>/online (дата или месяц или week)</code> — показать кто работает сегодня, в конкретный день, за месяц или за неделю",
+    "time": "🔷 <code>/time</code> — показать текущее время по Москве",
+    "sobranie": "🔷 <code>/sobranie (дата/время)</code> — запланировать собрание и напоминания",
+    "add": "🔷 <code>/add (@username)</code> — добавить дизайнера",
+    "remove": "🔷 <code>/remove (@username)</code> — убрать дизайнера из активных",
+    "designers": "🔷 <code>/designers</code> — показать активных дизайнеров",
+    "smena": "🔷 <code>/smena (дата) (@designer)</code> — задать старт графика 2/2",
+    "swap": "🔷 <code>/swap (дата) (@designer) (причина)</code> — назначить подмену",
+    "clearswap": "🔷 <code>/clearswap (дата)</code> — отменить подмену",
+    "setlog": "🔷 <code>/setlog</code> — назначить текущую тему логом задач",
+    "setreports": "🔷 <code>/setreports</code> — назначить текущую тему отчетами",
+    "setdaily": "🔷 <code>/setdaily</code> — назначить текущий чат или тему для утренних задач",
+    "fixquality": "🔷 <code>/fixquality (ID) (0/1)</code> — исправить качество: 0 до 3 правок, 1 больше 3 правок",
+    "fixdeadline": "🔷 <code>/fixdeadline (ID) (0/1)</code> — исправить срок: 0 в срок, 1 просрочено",
 }
 
 MAIN_HELP_COMMANDS = [
     "help", "task", "retask", "ok", "done", "reassign", "rework", "tasks",
-    "stats", "report", "top", "history", "online", "time", "sobranie",
+    "note", "stats", "report", "top", "history", "online", "time", "sobranie",
     "add", "remove", "designers", "smena", "swap", "clearswap",
     "setlog", "setreports", "setdaily", "fixquality", "fixdeadline",
 ]
 
 HELP_GROUPS = [
     ("Основное", ["help", "time", "sobranie"]),
-    ("Задачи", ["task", "retask", "ok", "done", "reassign", "rework", "tasks"]),
+    ("Задачи", ["task", "retask", "ok", "done", "reassign", "rework", "tasks", "note"]),
     ("Статистика", ["stats", "report", "top", "history"]),
     ("График", ["online", "designers", "smena", "swap", "clearswap"]),
     ("Настройки", ["add", "remove", "setlog", "setreports", "setdaily", "fixquality", "fixdeadline"]),
@@ -200,7 +240,11 @@ HELP_GROUPS = [
 
 def help_text(title: str, commands: list[str]) -> str:
     if commands == MAIN_HELP_COMMANDS:
-        lines = [f"<b>{title}</b>", "<i>Команды собраны по разделам.</i>"]
+        lines = [
+            f"<b>{title}</b>",
+            "<i>Команды собраны по разделам.</i>",
+            "<i>Дата/время: дата = до 23:59, время = сегодня, дата+время = точный дедлайн.</i>",
+        ]
         for group_title, group_commands in HELP_GROUPS:
             lines.append("")
             lines.append(f"<b>{group_title}</b>")
@@ -209,8 +253,10 @@ def help_text(title: str, commands: list[str]) -> str:
     return "\n".join([f"<b>{title}</b>", *[COMMAND_HELP[name] for name in commands]])
 
 
-def command_usage(command: str, error: str = "Неверный формат.") -> str:
-    return f"❌ {error}\n{COMMAND_HELP[command]}"
+def command_usage(command: str, note: str = "") -> str:
+    if note and note != "Можно использовать так:":
+        return f"{note}\nМожно использовать так:\n{COMMAND_HELP[command]}"
+    return f"Можно использовать так:\n{COMMAND_HELP[command]}"
 
 
 def pct(part: int, total: int) -> str:
@@ -232,6 +278,12 @@ def meeting_date_text(value: datetime) -> str:
 
 def meeting_reminder_text(meeting_at: datetime, kind: str) -> str:
     date_text = meeting_date_text(meeting_at)
+    if kind == "scheduled":
+        return f"""<b>Команда, всем привет! ❤️</b>
+
+Запланировали общее собрание команды в Zoom: {date_text}.
+
+Ближе к встрече я отдельно напомню за день и ещё раз в день созвона. Пожалуйста, держите это время в календаре."""
     if kind == "day_before":
         return f"""<b>Команда, всем привет! ❤️</b>
 
@@ -384,6 +436,14 @@ def init_db() -> None:
             FOREIGN KEY(task_id) REFERENCES tasks(id)
         );
 
+        CREATE TABLE IF NOT EXISTS daily_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            text TEXT NOT NULL,
+            sent_at TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
         CREATE INDEX IF NOT EXISTS idx_tasks_completed_month ON tasks(completed_month);
         CREATE INDEX IF NOT EXISTS idx_tasks_created_month ON tasks(created_month);
@@ -396,6 +456,7 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_chat_messages_month_user ON chat_messages(month, user_display);
         CREATE INDEX IF NOT EXISTS idx_meetings_reminders ON meetings(meeting_at, day_before_sent, two_hours_sent);
         CREATE INDEX IF NOT EXISTS idx_stats_snapshots_month_scope ON stats_snapshots(month, scope);
+        CREATE INDEX IF NOT EXISTS idx_daily_notes_unsent ON daily_notes(sent_at, created_at);
         """)
 
 
@@ -433,6 +494,25 @@ def log_action(task_id: Optional[int], action: str, user: str, comment: str = ""
         conn.execute(
             "INSERT INTO task_log(created_at,task_id,action,user,comment,old_status,new_status) VALUES(?,?,?,?,?,?,?)",
             (now_iso(), task_id, action, user, comment, old_status, new_status),
+        )
+
+
+def pending_daily_notes(before: datetime):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM daily_notes WHERE sent_at IS NULL AND created_at<=? ORDER BY created_at ASC",
+            (before.isoformat(timespec="seconds"),),
+        ).fetchall()
+
+
+def mark_daily_notes_sent(note_ids: list[int], sent_at: str) -> None:
+    if not note_ids:
+        return
+    placeholders = ",".join("?" for _ in note_ids)
+    with db() as conn:
+        conn.execute(
+            f"UPDATE daily_notes SET sent_at=? WHERE id IN ({placeholders})",
+            [sent_at, *note_ids],
         )
 
 
@@ -611,10 +691,11 @@ def save_stats_snapshot(month: str, scope: str, requested_by: str, payload: dict
 
 
 async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-    topic = get_setting(f"log_topic:{chat_id}")
+    target_chat_id = get_log_chat_id() or chat_id
+    topic = get_setting(f"log_topic:{target_chat_id}")
     try:
         return await context.bot.send_message(
-            chat_id=chat_id,
+            chat_id=target_chat_id,
             message_thread_id=int(topic) if topic else None,
             text=text,
             parse_mode=ParseMode.HTML,
@@ -650,6 +731,12 @@ def avg_completion(rows) -> Optional[float]:
         start = r["accepted_at"] or r["created_at"]
         durations.append((parse_iso_msk(r["completed_at"]) - parse_iso_msk(start)).total_seconds())
     return sum(durations) / len(durations) if durations else None
+
+
+def minutes_value(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "—"
+    return f"{seconds / 60:.2f}"
 
 
 def counter_payload(items) -> list[dict[str, Any]]:
@@ -760,28 +847,126 @@ def stats_payload(month: Optional[str], personal_user: Optional[str] = None) -> 
 def report_payload(month: str) -> dict[str, Any]:
     payload = stats_payload(month)
     rows = completed_rows(month)
+    rework_tasks = sum(1 for r in rows if (r["rework_count"] or 0) > 0)
+    late = sum(1 for r in rows if r["on_time"] == 0)
+    overall_avg_seconds = avg_completion(rows)
     per = defaultdict(list)
     for r in rows:
         per[r["accepted_by"] or "—"].append(r)
     performers = sorted(per.items(), key=lambda x: len(x[1]), reverse=True)
     report_rows = []
     for name, rs in performers[:10]:
-        avg_seconds = avg_completion(rs)
+        performer_avg_seconds = avg_completion(rs)
         report_rows.append({
             "name": name,
             "completed": len(rs),
             "on_time": sum(1 for r in rs if r["on_time"] == 1),
             "late": sum(1 for r in rs if r["on_time"] == 0),
             "quality_bad": sum(1 for r in rs if r["quality_flag"] == 1),
-            "avg_completion_seconds": avg_seconds,
-            "avg_completion": human_duration(avg_seconds),
+            "avg_completion_seconds": performer_avg_seconds,
+            "avg_completion": human_duration(performer_avg_seconds),
         })
     payload["scope"] = "report"
+    payload["summary"] = {
+        "completed": len(rows),
+        "rework_tasks": rework_tasks,
+        "rework_percent": pct(rework_tasks, len(rows)),
+        "late": late,
+        "late_percent": pct(late, len(rows)),
+        "avg_completion_seconds": overall_avg_seconds,
+        "avg_completion_minutes": minutes_value(overall_avg_seconds),
+    }
     payload["report"] = {
         "performers": report_rows,
         "best": report_rows[0] if report_rows else None,
     }
     return payload
+
+
+REPORT_SUMMARY_FIELDS = [
+    "Месяц",
+    "Выполнено задач",
+    "Задач отправлено на исправление",
+    "% задач с исправлениями",
+    "Просрочено задач",
+    "% задач с просрочкой",
+    "Среднее время выполнения, минут",
+]
+
+REPORT_TASK_FIELDS = [
+    "ID",
+    "Постановщик",
+    "Исполнитель",
+    "Создана",
+    "Принята",
+    "Завершена",
+    "Дедлайн",
+    "Просрочена",
+    "Исправлений",
+    "Время выполнения, минут",
+    "Описание",
+]
+
+
+def task_completion_minutes(row) -> str:
+    if not row["completed_at"]:
+        return "—"
+    start = row["accepted_at"] or row["created_at"]
+    seconds = (parse_iso_msk(row["completed_at"]) - parse_iso_msk(start)).total_seconds()
+    return f"{seconds / 60:.2f}"
+
+
+def report_summary_records(month: str, payload: dict[str, Any]) -> list[dict[str, Any]]:
+    summary = payload["summary"]
+    return [{
+        "Месяц": month,
+        "Выполнено задач": summary["completed"],
+        "Задач отправлено на исправление": summary["rework_tasks"],
+        "% задач с исправлениями": summary["rework_percent"],
+        "Просрочено задач": summary["late"],
+        "% задач с просрочкой": summary["late_percent"],
+        "Среднее время выполнения, минут": summary["avg_completion_minutes"],
+    }]
+
+
+def report_task_records(rows) -> list[dict[str, Any]]:
+    return [{
+        "ID": row["id"],
+        "Постановщик": row["created_by"],
+        "Исполнитель": task_designer(row),
+        "Создана": fmt_dt(row["created_at"]),
+        "Принята": fmt_dt(row["accepted_at"]),
+        "Завершена": fmt_dt(row["completed_at"]),
+        "Дедлайн": fmt_dt(row["deadline"]),
+        "Просрочена": "да" if row["on_time"] == 0 else "нет",
+        "Исправлений": row["rework_count"],
+        "Время выполнения, минут": task_completion_minutes(row),
+        "Описание": row["description"] or "",
+    } for row in rows]
+
+
+def report_summary_text(month: str, payload: dict[str, Any]) -> str:
+    summary = payload["summary"]
+    return (
+        f"📦 Отчет за {month}\n"
+        f"Выполнено задач: {summary['completed']}\n"
+        f"Задач отправлено на исправление: {summary['rework_tasks']}\n"
+        f"% задач с исправлениями: {summary['rework_percent']}\n"
+        f"Просрочено задач: {summary['late']}\n"
+        f"% задач с просрочкой: {summary['late_percent']}\n"
+        f"Среднее время выполнения, минут: {summary['avg_completion_minutes']}"
+    )
+
+
+def build_report_zip(month: str, payload: dict[str, Any], rows) -> tuple[bytes, str]:
+    period = month.replace(".", "-")
+    filename = f"design_kpi_report_{period}.zip"
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("summary.csv", csv_bytes(report_summary_records(month, payload), REPORT_SUMMARY_FIELDS))
+        zf.writestr("tasks.csv", csv_bytes(report_task_records(rows), REPORT_TASK_FIELDS))
+    archive.seek(0)
+    return archive.getvalue(), filename
 
 
 def top_payload(month: str) -> dict[str, Any]:
@@ -1050,16 +1235,21 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def setup_commands(app: Application):
     await app.bot.set_my_commands([
         BotCommand("help", "меню команд"),
-        BotCommand("task", "(задача) (дата) (время) (описание)"),
-        BotCommand("retask", "(ID) (задача) (дата) (время) (описание)"),
+        BotCommand("task", "(дата/время) (описание)"),
+        BotCommand("retask", "(ID) (дата/время) (описание)"),
+        BotCommand("ok", "(ID) принять задачу"),
+        BotCommand("done", "(ID) (0/1) завершить задачу"),
+        BotCommand("reassign", "(ID) (@username) переназначить"),
+        BotCommand("rework", "(ID) (дата/время) (причина)"),
         BotCommand("tasks", "активные задачи"),
+        BotCommand("note", "(комментарий) для утренней сводки"),
         BotCommand("stats", "(месяц.год) (@username) статистика"),
-        BotCommand("report", "(месяц) месячный отчет"),
+        BotCommand("report", "(месяц) отчет zip-файлом"),
         BotCommand("top", "(месяц) рейтинг"),
         BotCommand("history", "(месяц/all) (@designer) история файлом"),
         BotCommand("online", "(дата или месяц или week) кто работает"),
         BotCommand("time", "время по Москве"),
-        BotCommand("sobranie", "(дата) (время) собрание"),
+        BotCommand("sobranie", "(дата/время) собрание"),
         BotCommand("add", "(@username) добавить дизайнера"),
         BotCommand("remove", "(@username) удалить дизайнера"),
         BotCommand("designers", "активные дизайнеры"),
@@ -1079,21 +1269,19 @@ async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def sobranie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 2:
-        await update.message.reply_text(command_usage("sobranie"))
-        return
-    try:
-        meeting_at = parse_dt(f"{context.args[0].rstrip(',')} {context.args[1].rstrip(',')}")
-    except ValueError:
-        await update.message.reply_text(command_usage("sobranie", "Дата и время нужны в формате 06.07.2026 11:00."))
+    meeting_at, _, error = parse_datetime_and_text(" ".join(context.args or []), need_text=False)
+    if error or not meeting_at:
+        await update.message.reply_text(command_usage("sobranie"), parse_mode=ParseMode.HTML)
         return
     current_msk = now_msk()
     if meeting_at <= current_msk:
         await update.message.reply_text(f"❌ Нельзя поставить собрание в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
-    if not get_setting("daily_chat_id"):
+    chat_id = get_setting("daily_chat_id")
+    if not chat_id:
         await update.message.reply_text("❌ Сначала назначьте чат для напоминаний командой /setdaily.")
         return
+    topic = get_setting(f"daily_topic:{chat_id}")
 
     actor = user_name(update)
     with db() as conn:
@@ -1106,6 +1294,15 @@ async def sobranie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     day_before = datetime.combine(meeting_at.date() - timedelta(days=1), dt_time(hour=18, minute=0, tzinfo=MSK))
     two_hours = meeting_at - timedelta(hours=2)
+    try:
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            message_thread_id=int(topic) if topic else None,
+            text=meeting_reminder_text(meeting_at, "scheduled"),
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception as e:
+        logger.warning("Immediate meeting announcement failed for meeting %s: %s", meeting_id, e)
     await update.message.reply_text(
         f"✅ Собрание #{meeting_id} запланировано.\n"
         f"Когда: {meeting_date_text(meeting_at)}\n"
@@ -1118,7 +1315,7 @@ async def sobranie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month, designer, error = parse_history_args(context.args or [])
     if error:
-        await update.message.reply_text(command_usage("history", error))
+        await update.message.reply_text(command_usage("history", error), parse_mode=ParseMode.HTML)
         return
 
     rows = completed_history_rows(month, designer)
@@ -1144,17 +1341,18 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
-    title, deadline, desc, error = parse_task_body(raw)
+    deadline, desc, error = parse_datetime_and_text(raw)
     if error:
-        await update.message.reply_text(command_usage("task", error))
+        await update.message.reply_text(command_usage("task", error), parse_mode=ParseMode.HTML)
         return
-    if not title or not deadline or not desc:
-        await update.message.reply_text(command_usage("task"))
+    if not deadline or not desc:
+        await update.message.reply_text(command_usage("task"), parse_mode=ParseMode.HTML)
         return
     current_msk = now_msk()
     if deadline <= current_msk:
         await update.message.reply_text(f"❌ Нельзя создать задачу с дедлайном в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
+    title = make_task_title(desc)
     creator = user_name(update)
     created_at = now_iso()
     with db() as conn:
@@ -1166,9 +1364,24 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         task_id = cur.lastrowid
     log_action(task_id, "create", creator, title, "", STATUSES["waiting"])
     remember_task_message(task_id, update.message, "task_source")
-    reply_msg = await update.message.reply_text(f"✅ Задача #{task_id} создана. Статус: ожидает принятия.")
+    shift_designer, shift_mode, _ = shift_for(current_msk.date())
+    designer_prefix = f"{html.escape(shift_designer)}, " if shift_mode != "error" and shift_designer else ""
+    reply_msg = await update.message.reply_text(
+        f"📌 {designer_prefix}поступила задача от {html.escape(creator)} под номером #{task_id}.\n"
+        f"Дедлайн: {deadline.strftime(DATETIME_FMT)}\n"
+        f"Чтобы принять задачу: <code>/ok {task_id}</code> или поставьте реакцию на это сообщение.",
+        parse_mode=ParseMode.HTML,
+    )
     remember_task_message(task_id, reply_msg, "task_reply")
-    log_msg = await send_log(context, update.effective_chat.id, f"<b>✅ Создана задача #{task_id}</b>\n\n<b>{title}</b>\nДедлайн: {deadline.strftime(DATETIME_FMT)}\nАвтор: {creator}\n\n{desc}")
+    log_msg = await send_log(
+        context,
+        update.effective_chat.id,
+        f"<b>✅ Создана задача #{task_id}</b>\n\n"
+        f"<b>{html.escape(title)}</b>\n"
+        f"Дедлайн: {deadline.strftime(DATETIME_FMT)}\n"
+        f"Автор: {html.escape(creator)}\n\n"
+        f"{html.escape(desc)}",
+    )
     remember_task_message(task_id, log_msg, "task_log")
 
 
@@ -1176,7 +1389,7 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = update.message.text.partition(" ")[2]
     task_id_s, sep, body = raw.partition(" ")
     if not sep or not task_id_s.isdigit():
-        await update.message.reply_text(command_usage("retask"))
+        await update.message.reply_text(command_usage("retask"), parse_mode=ParseMode.HTML)
         return
 
     task_id = int(task_id_s)
@@ -1185,13 +1398,14 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Задача не найдена.")
         return
 
-    new_title, new_deadline, new_desc, error = parse_task_body(body)
+    new_deadline, new_desc, error = parse_datetime_and_text(body)
     if error:
-        await update.message.reply_text(command_usage("retask", error))
+        await update.message.reply_text(command_usage("retask", error), parse_mode=ParseMode.HTML)
         return
-    if not new_title or not new_deadline or not new_desc:
-        await update.message.reply_text(command_usage("retask"))
+    if not new_deadline or not new_desc:
+        await update.message.reply_text(command_usage("retask"), parse_mode=ParseMode.HTML)
         return
+    new_title = make_task_title(new_desc)
 
     current_msk = now_msk()
     if row["status"] != STATUSES["done"] and new_deadline <= current_msk:
@@ -1242,7 +1456,7 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].isdigit():
-        await update.message.reply_text(command_usage("ok"))
+        await update.message.reply_text(command_usage("ok"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0])
     row = task_by_id(task_id)
@@ -1256,8 +1470,7 @@ async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("UPDATE tasks SET accepted_by=?, accepted_at=?, status=? WHERE id=?", (executor, now_iso(), STATUSES["in_progress"], task_id))
     log_action(task_id, "accept", executor, "", row["status"], STATUSES["in_progress"])
-    await update.message.reply_text(f"🔵 Задача #{task_id} принята в работу. Исполнитель: {executor}")
-    await send_log(context, update.effective_chat.id, f"<b>🔵 Задача #{task_id} принята</b>\nИсполнитель: {executor}")
+    await send_log(context, update.effective_chat.id, f"<b>🔵 Задача #{task_id} принята</b>\nИсполнитель: {html.escape(executor)}")
 
 
 async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1289,19 +1502,12 @@ async def reaction_accept_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     log_action(task_id, "accept_reaction", executor, f"reaction_message_id={reaction.message_id}", row["status"], STATUSES["in_progress"])
 
     text = f"<b>🔵 Задача #{task_id} принята реакцией</b>\nИсполнитель: {html.escape(executor)}"
-    await context.bot.send_message(
-        chat_id=reaction.chat.id,
-        message_thread_id=message_link["thread_id"],
-        text=text,
-        parse_mode=ParseMode.HTML,
-    )
-    if reaction.chat.id != get_log_chat_id():
-        await send_log(context, reaction.chat.id, text)
+    await send_log(context, reaction.chat.id, text)
 
 
 async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not context.args[0].isdigit():
-        await update.message.reply_text(command_usage("reassign"))
+        await update.message.reply_text(command_usage("reassign"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0])
     new_user = context.args[1]
@@ -1319,12 +1525,19 @@ async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_action(task_id, "reassign", actor, f"{old} -> {new_user}", row["status"], row["status"])
     msg = f"🔄 Задача #{task_id} переназначена.\n\nСтарый исполнитель: {old}\nНовый исполнитель: {new_user}"
     await update.message.reply_text(msg)
-    await send_log(context, update.effective_chat.id, f"<b>🔄 Переназначение задачи #{task_id}</b>\nСтарый: {old}\nНовый: {new_user}\nКто изменил: {actor}")
+    await send_log(
+        context,
+        update.effective_chat.id,
+        f"<b>🔄 Переназначение задачи #{task_id}</b>\n"
+        f"Старый: {html.escape(old)}\n"
+        f"Новый: {html.escape(new_user)}\n"
+        f"Кто изменил: {html.escape(actor)}",
+    )
 
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
-        await update.message.reply_text(command_usage("done"))
+        await update.message.reply_text(command_usage("done"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0])
     qflag = int(context.args[1])
@@ -1344,24 +1557,29 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     log_action(task_id, "done", actor, f"quality={qflag}; on_time={on_time}", row["status"], STATUSES["done"])
     await update.message.reply_text(f"🟢 Задача #{task_id} завершена. Срок: {deadline_status}. Правки: {'более 3' if qflag else 'до 3'}.")
-    await send_log(context, update.effective_chat.id, f"<b>🟢 Завершена задача #{task_id}</b>\nСрок: {deadline_status}\nПравки: {'более 3' if qflag else 'до 3'}\nЗакрыл: {actor}")
+    await send_log(
+        context,
+        update.effective_chat.id,
+        f"<b>🟢 Завершена задача #{task_id}</b>\n"
+        f"Срок: {deadline_status}\n"
+        f"Правки: {'более 3' if qflag else 'до 3'}\n"
+        f"Закрыл: {html.escape(actor)}",
+    )
 
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) < 4 or not context.args[0].isdigit():
-        await update.message.reply_text(command_usage("rework"))
+    if len(context.args) < 3 or not context.args[0].isdigit():
+        await update.message.reply_text(command_usage("rework"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0])
-    try:
-        new_deadline = parse_dt(f"{context.args[1]} {context.args[2]}")
-    except ValueError:
-        await update.message.reply_text(command_usage("rework", "Дедлайн нужен в формате 31.07.2026 18:00."))
+    new_deadline, reason, error = parse_datetime_and_text(" ".join(context.args[1:]))
+    if error or not new_deadline:
+        await update.message.reply_text(command_usage("rework", error or "Можно использовать так:"), parse_mode=ParseMode.HTML)
         return
     current_msk = now_msk()
     if new_deadline <= current_msk:
         await update.message.reply_text(f"❌ Нельзя поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
-    reason = " ".join(context.args[3:]).strip()
     row = task_by_id(task_id)
     if not row:
         await update.message.reply_text("❌ Задача не найдена.")
@@ -1417,9 +1635,35 @@ async def tasks_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = ["<b>📋 АКТИВНЫЕ ЗАДАЧИ</b>", "· · ·"]
     current_msk = now_msk()
     for r in rows:
-        deadline_note = "\nСрок: просрочен" if parse_iso_msk(r["deadline"]) < current_msk else ""
-        lines.append(f"<b>#{r['id']} — {r['title']}</b>\nДедлайн: {fmt_dt(r['deadline'])}{deadline_note}\nСтатус: {r['status']}\nИсполнитель: {r['accepted_by'] or '—'}")
+        created_date = parse_iso_msk(r["created_at"]).strftime(DATE_FMT)
+        link = task_source_link(r["id"])
+        task_label = f"Задача #{r['id']} от {created_date}"
+        task_title = f'<a href="{link}">{task_label}</a>' if link else task_label
+        deadline_note = " · просрочен" if parse_iso_msk(r["deadline"]) < current_msk else ""
+        lines.append(
+            f"<b>{task_title}</b>\n"
+            f"Дедлайн: {fmt_dt(r['deadline'])}{deadline_note}\n"
+            f"Статус: {html.escape(r['status'])}\n"
+            f"Исполнитель: {html.escape(r['accepted_by'] or '—')}\n"
+            f"Постановщик: {html.escape(r['created_by'])}\n"
+            f"Описание задачи:\n{html_quote_code(short_text(r['description'] or '—'))}"
+        )
     await update.message.reply_text("\n\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def note_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.partition(" ")[2].strip()
+    if not text:
+        await update.message.reply_text(command_usage("note"), parse_mode=ParseMode.HTML)
+        return
+    actor = user_name(update)
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO daily_notes(created_at,created_by,text) VALUES(?,?,?)",
+            (now_iso(), actor, text),
+        )
+    log_action(None, "daily_note", actor, short_text(text, 500))
+    await update.message.reply_text("✅ Комментарий сохранён. Добавлю его отдельным сообщением к ближайшей утренней сводке.")
 
 
 def stats_text(month: Optional[str], personal_user: Optional[str] = None, payload: Optional[dict[str, Any]] = None) -> str:
@@ -1514,7 +1758,7 @@ def stats_text(month: Optional[str], personal_user: Optional[str] = None, payloa
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month, user, error = parse_month_user_args(context.args or [])
     if error:
-        await update.message.reply_text(command_usage("stats", error))
+        await update.message.reply_text(command_usage("stats", error), parse_mode=ParseMode.HTML)
         return
     payload = stats_payload(month, user)
     text = stats_text(month, user, payload)
@@ -1538,10 +1782,19 @@ def report_text(month: str, payload: Optional[dict[str, Any]] = None) -> str:
 
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     month = context.args[0] if context.args else current_month()
+    try:
+        datetime.strptime(month, "%m.%Y")
+    except ValueError:
+        await update.message.reply_text(command_usage("report", "Месяц можно указать в формате 06.2026."), parse_mode=ParseMode.HTML)
+        return
+    rows = completed_rows(month)
     payload = report_payload(month)
-    text = report_text(month, payload)
+    data, filename = build_report_zip(month, payload, rows)
+    file_obj = io.BytesIO(data)
+    file_obj.name = filename
+    text = report_summary_text(month, payload)
     save_stats_snapshot(month, "report", user_name(update), payload, text)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    await update.message.reply_document(document=file_obj, filename=filename, caption=text)
 
 
 async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1603,7 +1856,7 @@ async def top_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(command_usage("add"))
+        await update.message.reply_text(command_usage("add"), parse_mode=ParseMode.HTML)
         return
     username = context.args[0]
     with db() as conn:
@@ -1613,7 +1866,7 @@ async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def remove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(command_usage("remove"))
+        await update.message.reply_text(command_usage("remove"), parse_mode=ParseMode.HTML)
         return
     with db() as conn:
         conn.execute("UPDATE designers SET active=0 WHERE username=?", (context.args[0],))
@@ -1658,12 +1911,12 @@ def shift_for(d: date) -> Tuple[Optional[str], Optional[str], Optional[str]]:
 
 async def smena_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text(command_usage("smena"))
+        await update.message.reply_text(command_usage("smena"), parse_mode=ParseMode.HTML)
         return
     try:
         d = parse_date(context.args[0])
     except ValueError:
-        await update.message.reply_text(command_usage("smena", "Дата нужна в формате 01.08.2026."))
+        await update.message.reply_text(command_usage("smena", "Дата нужна в формате 01.08.2026."), parse_mode=ParseMode.HTML)
         return
     designer = context.args[1]
     if designer not in active_designers():
@@ -1694,7 +1947,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             start = datetime.strptime(f"01.{arg}", DATE_FMT).date()
         except ValueError:
-            await update.message.reply_text(command_usage("online", "Месяц нужен в формате 06.2026."))
+            await update.message.reply_text(command_usage("online", "Месяц нужен в формате 06.2026."), parse_mode=ParseMode.HTML)
             return
         next_month = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
         days = (next_month - start).days
@@ -1714,7 +1967,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             d = parse_date(arg)
         except ValueError:
-            await update.message.reply_text(command_usage("online", "Дата нужна в формате 05.08.2026, месяц 06.2026 или week."))
+            await update.message.reply_text(command_usage("online", "Дата нужна в формате 05.08.2026, месяц 06.2026 или week."), parse_mode=ParseMode.HTML)
             return
     else:
         d = now_msk().date()
@@ -1739,12 +1992,12 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2:
-        await update.message.reply_text(command_usage("swap"))
+        await update.message.reply_text(command_usage("swap"), parse_mode=ParseMode.HTML)
         return
     try:
         d = parse_date(context.args[0])
     except ValueError:
-        await update.message.reply_text(command_usage("swap", "Дата нужна в формате 05.08.2026."))
+        await update.message.reply_text(command_usage("swap", "Дата нужна в формате 05.08.2026."), parse_mode=ParseMode.HTML)
         return
     designer = context.args[1]
     reason = " ".join(context.args[2:]) or "—"
@@ -1755,17 +2008,25 @@ async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("INSERT INTO shift_overrides(date,designer,reason,created_at,created_by) VALUES(?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET designer=excluded.designer, reason=excluded.reason, created_at=excluded.created_at, created_by=excluded.created_by", (fmt_date(d), designer, reason, now_iso(), user_name(update)))
     await update.message.reply_text(f"🔄 Подмена назначена.\n\nДата: {fmt_date(d)}\nВместо: {old}\nРаботает: {designer}\nПричина: {reason}")
-    await send_log(context, update.effective_chat.id, f"<b>🔄 Назначена подмена</b>\nДата: {fmt_date(d)}\nВместо: {old}\nРаботает: {designer}\nПричина: {reason}")
+    await send_log(
+        context,
+        update.effective_chat.id,
+        f"<b>🔄 Назначена подмена</b>\n"
+        f"Дата: {fmt_date(d)}\n"
+        f"Вместо: {html.escape(old or '—')}\n"
+        f"Работает: {html.escape(designer)}\n"
+        f"Причина: {html.escape(reason)}",
+    )
 
 
 async def clearswap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text(command_usage("clearswap"))
+        await update.message.reply_text(command_usage("clearswap"), parse_mode=ParseMode.HTML)
         return
     try:
         d = parse_date(context.args[0])
     except ValueError:
-        await update.message.reply_text(command_usage("clearswap", "Дата нужна в формате 05.08.2026."))
+        await update.message.reply_text(command_usage("clearswap", "Дата нужна в формате 05.08.2026."), parse_mode=ParseMode.HTML)
         return
     with db() as conn:
         conn.execute("DELETE FROM shift_overrides WHERE date=?", (fmt_date(d),))
@@ -1806,7 +2067,7 @@ async def setdaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def fixquality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
-        await update.message.reply_text(command_usage("fixquality"))
+        await update.message.reply_text(command_usage("fixquality"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0]); val = int(context.args[1])
     with db() as conn:
@@ -1817,7 +2078,7 @@ async def fixquality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) < 2 or not context.args[0].isdigit() or context.args[1] not in {"0", "1"}:
-        await update.message.reply_text(command_usage("fixdeadline"))
+        await update.message.reply_text(command_usage("fixdeadline"), parse_mode=ParseMode.HTML)
         return
     task_id = int(context.args[0]); late = int(context.args[1])
     on_time = 0 if late else 1
@@ -1878,6 +2139,45 @@ async def deadline_alert_job(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Deadline alert failed for task %s: %s", r["id"], e)
 
 
+async def auto_shift_reassign_job(context: ContextTypes.DEFAULT_TYPE):
+    current_msk = now_msk()
+    today = current_msk.date()
+    designer, mode, reason = shift_for(today)
+    if mode == "error":
+        logger.warning("Cannot auto reassign tasks for %s: %s", fmt_date(today), reason)
+        return
+
+    assigned_at = current_msk.isoformat(timespec="seconds")
+    reassigned = []
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM tasks WHERE status!=? ORDER BY deadline ASC",
+            (STATUSES["done"],),
+        ).fetchall()
+        for row in rows:
+            old = row["accepted_by"] or ""
+            if user_key(old) == user_key(designer):
+                continue
+            new_status = STATUSES["in_progress"] if row["status"] == STATUSES["waiting"] else row["status"]
+            conn.execute(
+                """UPDATE tasks
+                   SET accepted_by=?, accepted_at=?, status=?
+                   WHERE id=?""",
+                (designer, assigned_at, new_status, row["id"]),
+            )
+            reassigned.append((row["id"], old or "—", new_status, row["status"]))
+
+    for task_id, old, new_status, old_status in reassigned:
+        log_action(
+            task_id,
+            "auto_reassign_shift",
+            "system",
+            f"{old} -> {designer}; date={fmt_date(today)}",
+            old_status,
+            new_status,
+        )
+
+
 async def daily_tasks_job(context: ContextTypes.DEFAULT_TYPE):
     current_msk = now_msk()
     today = current_msk.date()
@@ -1895,36 +2195,6 @@ async def daily_tasks_job(context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    assigned_at = current_msk.isoformat(timespec="seconds")
-    reassigned = []
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status!=? ORDER BY deadline ASC",
-            (STATUSES["done"],),
-        ).fetchall()
-        for row in rows:
-            old = row["accepted_by"] or ""
-            if user_key(old) == user_key(designer):
-                continue
-            new_status = STATUSES["in_progress"] if row["status"] == STATUSES["waiting"] else row["status"]
-            conn.execute(
-                """UPDATE tasks
-                   SET accepted_by=?, accepted_at=COALESCE(accepted_at, ?), status=?
-                   WHERE id=?""",
-                (designer, assigned_at, new_status, row["id"]),
-            )
-            reassigned.append((row["id"], old or "—", new_status, row["status"]))
-
-    for task_id, old, new_status, old_status in reassigned:
-        log_action(
-            task_id,
-            "auto_reassign_shift",
-            "system",
-            f"{old} -> {designer}; date={fmt_date(today)}",
-            old_status,
-            new_status,
-        )
-
     with db() as conn:
         rows = conn.execute(
             "SELECT * FROM tasks WHERE status!=? AND accepted_by=? ORDER BY deadline ASC",
@@ -1936,9 +2206,6 @@ async def daily_tasks_job(context: ContextTypes.DEFAULT_TYPE):
         f"<b>Доброе утро, {html.escape(designer)}!</b>",
         f"Сегодня твоя смена{shift_note}. Вот задачи на {fmt_date(today)}:",
     ]
-    if reassigned:
-        ids = ", ".join(f"#{task_id}" for task_id, *_ in reassigned)
-        lines.append(f"Автоматически перенаправил на тебя: {ids}")
 
     if not rows:
         lines.append("\nАктивных задач на сегодня нет.")
@@ -1961,6 +2228,22 @@ async def daily_tasks_job(context: ContextTypes.DEFAULT_TYPE):
         text="\n".join(lines),
         parse_mode=ParseMode.HTML,
     )
+
+    notes = pending_daily_notes(current_msk)
+    if notes:
+        note_lines = [f"<b>Комментарии к утренней сводке для {html.escape(designer)}</b>", "· · ·"]
+        for note in notes:
+            note_lines.append(
+                f"<b>Комментарий от {html.escape(note['created_by'])} по задачам:</b>\n"
+                f"{html_note_quote(note['text'])}"
+            )
+        await context.bot.send_message(
+            chat_id=int(chat_id),
+            message_thread_id=int(topic) if topic else None,
+            text="\n\n".join(note_lines),
+            parse_mode=ParseMode.HTML,
+        )
+        mark_daily_notes_sent([note["id"] for note in notes], now_iso())
 
 
 async def meeting_reminders_job(context: ContextTypes.DEFAULT_TYPE):
@@ -2023,8 +2306,18 @@ async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
     topic = get_setting(f"reports_topic:{chat_id}")
     try:
         payload = report_payload(month)
-        text = report_text(month, payload)
-        await context.bot.send_message(chat_id=int(chat_id), message_thread_id=int(topic) if topic else None, text=text, parse_mode=ParseMode.HTML)
+        rows = completed_rows(month)
+        data, filename = build_report_zip(month, payload, rows)
+        file_obj = io.BytesIO(data)
+        file_obj.name = filename
+        text = report_summary_text(month, payload)
+        await context.bot.send_document(
+            chat_id=int(chat_id),
+            message_thread_id=int(topic) if topic else None,
+            document=file_obj,
+            filename=filename,
+            caption=text,
+        )
         save_stats_snapshot(month, "monthly_report", "system", payload, text)
         with db() as conn:
             conn.execute("INSERT INTO monthly_reports(month,sent_at) VALUES(?,?)", (month, now_iso()))
@@ -2055,7 +2348,7 @@ def main() -> None:
     handlers = [
         ("start", start), ("help", help_cmd), ("time", time_cmd), ("sobranie", sobranie_cmd),
         ("task", task_cmd), ("retask", retask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
-        ("tasks", tasks_cmd),
+        ("tasks", tasks_cmd), ("note", note_cmd),
         ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd), ("history", history_cmd),
         ("add", add_cmd), ("remove", remove_cmd), ("designers", designers_cmd),
         ("smena", smena_cmd), ("online", online_cmd), ("swap", swap_cmd), ("clearswap", clearswap_cmd),
@@ -2074,6 +2367,7 @@ def main() -> None:
     app.job_queue.scheduler.configure(timezone=MSK)
     app.job_queue.run_repeating(deadline_alert_job, interval=60 * 15, first=30)
     app.job_queue.run_repeating(meeting_reminders_job, interval=60 * 5, first=45)
+    app.job_queue.run_daily(auto_shift_reassign_job, time=dt_time(hour=0, minute=0, tzinfo=MSK))
     app.job_queue.run_daily(daily_tasks_job, time=dt_time(hour=9, minute=0, tzinfo=MSK))
     app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
