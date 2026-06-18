@@ -365,7 +365,6 @@ COMMAND_HELP = {
     "note": "🔷 <code>/note (комментарий)</code> — оставить комментарий для ближайшей утренней сводки",
     "stats": "🔷 <code>/stats (месяц.год) (@username)</code> — показать статистику: без параметров вся команда за всё время, с ником конкретный человек",
     "report": "🔷 <code>/report (месяц)</code> — скачать месячный отчет zip-файлом; месяц можно не писать",
-    "month_report": "🔷 <code>/month_report (месяц)</code> — скачать месячный отчет zip-файлом; месяц можно не писать",
     "top": "🔷 <code>/top (месяц)</code> — показать месячные номинации; месяц можно не писать",
     "history": "🔷 <code>/history (месяц/all) (@designer)</code> — скачать историю выполненных задач; параметры можно не писать",
     "online": "🔷 <code>/online (дата или месяц или week)</code> — показать кто работает сегодня, в конкретный день, за месяц или за неделю",
@@ -634,24 +633,6 @@ def get_setting(key: str) -> Optional[str]:
         return row["value"] if row else None
 
 
-def get_log_chat_id() -> Optional[int]:
-    chat_id = get_setting("log_chat_id")
-    if chat_id:
-        try:
-            return int(chat_id)
-        except ValueError:
-            logger.warning("Invalid log_chat_id setting: %s", chat_id)
-    with db() as conn:
-        row = conn.execute("SELECT key FROM settings WHERE key LIKE 'log_topic:%' ORDER BY key LIMIT 1").fetchone()
-    if not row:
-        return None
-    try:
-        return int(row["key"].split(":", 1)[1])
-    except (IndexError, ValueError):
-        logger.warning("Invalid log topic setting key: %s", row["key"])
-        return None
-
-
 def log_action(task_id: Optional[int], action: str, user: str, comment: str = "", old_status: str = "", new_status: str = "") -> None:
     with db() as conn:
         conn.execute(
@@ -905,21 +886,6 @@ def save_stats_snapshot(month: str, scope: str, requested_by: str, payload: dict
         logger.warning("Cannot save stats snapshot: %s", e)
 
 
-async def send_log(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str):
-    target_chat_id = get_log_chat_id() or chat_id
-    topic = get_setting(f"log_topic:{target_chat_id}")
-    try:
-        return await context.bot.send_message(
-            chat_id=target_chat_id,
-            message_thread_id=int(topic) if topic else None,
-            text=text,
-            parse_mode=ParseMode.HTML,
-        )
-    except Exception as e:
-        logger.warning("Cannot send log: %s", e)
-        return None
-
-
 def task_by_id(task_id: int):
     with db() as conn:
         return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
@@ -1170,6 +1136,15 @@ def report_summary_text(month: str, payload: dict[str, Any]) -> str:
         f"Просрочено задач: {summary['late']}\n"
         f"% задач с просрочкой: {summary['late_percent']}\n"
         f"Среднее время выполнения, минут: {summary['avg_completion_minutes']}"
+    )
+
+
+def monthly_report_caption(month: str, payload: dict[str, Any]) -> str:
+    return (
+        f"Команда, поздравляю с успешным завершением месяца!\n"
+        f"Ниже короткая сводка за {month}, а подробные таблицы лежат в zip-файле.\n\n"
+        f"{report_summary_text(month, payload)}\n\n"
+        f"Хорошего старта нового месяца и приятной работы!"
     )
 
 
@@ -1473,8 +1448,7 @@ async def setup_commands(app: Application):
         BotCommand("smena", "(дата) (@designer) старт графика 2/2"),
         BotCommand("swap", "(дата) (@designer) подмена"),
         BotCommand("clearswap", "(дата) отменить подмену"),
-        BotCommand("setlog", "назначить лог"),
-        BotCommand("setreports", "назначить отчеты"),
+        BotCommand("setreport", "назначить отчеты"),
         BotCommand("setdaily", "назначить утренние задачи"),
         BotCommand("fixquality", "(ID) (0/1) исправить качество"),
         BotCommand("fixdeadline", "(ID) (0/1) исправить срок"),
@@ -1516,11 +1490,11 @@ async def sobranie_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current_msk = now_msk()
     if meeting_at <= current_msk:
-        await update.message.reply_text(f"❌ Нельзя поставить собрание в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
+        await update.message.reply_text(f"Пока не могу поставить собрание в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
     chat_id = get_setting("daily_chat_id")
     if not chat_id:
-        await update.message.reply_text("❌ Сначала назначьте чат для напоминаний командой /setdaily.")
+        await update.message.reply_text("Сначала назначьте чат для напоминаний командой /setdaily.")
         return
     topic = get_setting(f"daily_topic:{chat_id}")
 
@@ -1591,7 +1565,7 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current_msk = now_msk()
     if deadline <= current_msk:
-        await update.message.reply_text(f"❌ Нельзя создать задачу с дедлайном в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
+        await update.message.reply_text(f"Пока не могу создать задачу с дедлайном в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
     title = make_task_title(desc)
     creator = user_name(update)
@@ -1626,7 +1600,7 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = int(task_id_s)
     row = task_by_id(task_id)
     if not row:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
         return
 
     new_deadline, new_desc, error = parse_datetime_and_text(body)
@@ -1640,7 +1614,7 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     current_msk = now_msk()
     if row["status"] != STATUSES["done"] and new_deadline <= current_msk:
-        await update.message.reply_text(f"❌ Нельзя поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
+        await update.message.reply_text(f"Пока не могу поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
 
     on_time = row["on_time"]
@@ -1669,9 +1643,12 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     deadline_status = ""
     if row["completed_at"]:
         deadline_status = f"\nСрок после правки: {'в срок' if on_time else 'просрочен'}"
+    shift_designer, shift_mode, _ = shift_for(current_msk.date())
+    shift_line = ""
+    if shift_mode != "error" and shift_designer:
+        shift_line = f"\n{shift_designer}, задача обновлена."
     await update.message.reply_text(
-        f"✅ Задача #{task_id} изменена.\n\n"
-        f"Название: {new_title}\n"
+        f"Готово, задача #{task_id} изменена.{shift_line}\n"
         f"Дедлайн: {new_deadline.strftime(DATETIME_FMT)}"
         f"{deadline_status}"
     )
@@ -1683,10 +1660,10 @@ async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     task_id = int(context.args[0])
     row = task_by_id(task_id)
     if not row:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
         return
     if row["accepted_by"] and row["status"] != STATUSES["waiting"]:
-        await update.message.reply_text(f"❌ Задача уже назначена на {row['accepted_by']}.\nИспользуйте /reassign для переназначения.")
+        await update.message.reply_text(f"Задача уже в работе у {row['accepted_by']}.\nЕсли нужно поменять исполнителя, используйте /reassign.")
         return
     executor = user_name(update)
     with db() as conn:
@@ -1756,10 +1733,10 @@ async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_user = context.args[1]
     row = task_by_id(task_id)
     if not row:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
         return
     if row["status"] == STATUSES["done"]:
-        await update.message.reply_text("❌ Завершённую задачу нельзя переназначить.")
+        await update.message.reply_text("Завершённую задачу уже нельзя переназначить.")
         return
     old = row["accepted_by"] or "—"
     with db() as conn:
@@ -1778,7 +1755,7 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     qflag = int(context.args[1])
     row = task_by_id(task_id)
     if not row:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
         return
     completed_at = now_msk()
     deadline = parse_iso_msk(row["deadline"])
@@ -1805,15 +1782,15 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     current_msk = now_msk()
     if new_deadline <= current_msk:
-        await update.message.reply_text(f"❌ Нельзя поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
+        await update.message.reply_text(f"Пока не могу поставить дедлайн в прошлом.\nСейчас по Москве: {current_msk.strftime(DATETIME_FMT)}")
         return
     row = task_by_id(task_id)
     if not row:
-        await update.message.reply_text("❌ Задача не найдена.")
+        await update.message.reply_text("Не нашёл задачу с таким номером.")
         return
     designer, mode, shift_reason = shift_for(current_msk.date())
     if mode == "error":
-        await update.message.reply_text(f"❌ {shift_reason}")
+        await update.message.reply_text(f"Пока не получается: {shift_reason}")
         return
     assigned_at = now_iso()
     with db() as conn:
@@ -1837,7 +1814,8 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         STATUSES["rework"],
     )
     await update.message.reply_text(
-        f"🟠 Задача #{task_id} отправлена на доработку.\n"
+        f"Готово, задача #{task_id} отправлена на доработку.\n"
+        f"{designer}, задача на переделку у тебя.\n"
         f"Новый дедлайн: {new_deadline.strftime(DATETIME_FMT)}\n"
         f"Исполнитель сегодняшней смены: {designer}{shift_note}\n"
         f"Причина: {reason}"
@@ -2138,7 +2116,7 @@ async def smena_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     designer = context.args[1]
     if designer not in active_designers():
-        await update.message.reply_text("❌ Этот дизайнер не добавлен в активные. Используйте /add @username")
+        await update.message.reply_text("Этот дизайнер пока не добавлен в активные. Используйте /add @username.")
         return
     set_setting("shift_start_date", fmt_date(d))
     set_setting("shift_start_designer", designer)
@@ -2154,7 +2132,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = start + timedelta(days=i)
             designer, mode, reason = shift_for(d)
             if mode == "error":
-                await update.message.reply_text(f"❌ {reason}")
+                await update.message.reply_text(f"Пока не получается: {reason}")
                 return
             mark = " 🔄" if mode == "swap" else ""
             lines.append(f"{fmt_date(d)} — {designer}{mark}")
@@ -2174,7 +2152,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             d = start + timedelta(days=i)
             designer, mode, reason = shift_for(d)
             if mode == "error":
-                await update.message.reply_text(f"❌ {reason}")
+                await update.message.reply_text(f"Пока не получается: {reason}")
                 return
             mark = " 🔄" if mode == "swap" else ""
             lines.append(f"{fmt_date(d)} — {designer}{mark}")
@@ -2192,7 +2170,7 @@ async def online_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     designer, mode, reason = shift_for(d)
     if mode == "error":
-        await update.message.reply_text(f"❌ {reason}")
+        await update.message.reply_text(f"Пока не получается: {reason}")
         return
     next_d = d + timedelta(days=1)
     for _ in range(10):
@@ -2221,7 +2199,7 @@ async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = " ".join(context.args[2:]) or "—"
     old, mode, err = shift_for(d)
     if mode == "error":
-        await update.message.reply_text(f"❌ {err}")
+        await update.message.reply_text(f"Пока не получается: {err}")
         return
     with db() as conn:
         conn.execute("INSERT INTO shift_overrides(date,designer,reason,created_at,created_by) VALUES(?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET designer=excluded.designer, reason=excluded.reason, created_at=excluded.created_at, created_by=excluded.created_by", (fmt_date(d), designer, reason, now_iso(), user_name(update)))
@@ -2242,30 +2220,20 @@ async def clearswap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"↩️ Подмена на {fmt_date(d)} отменена. Возвращён стандартный график.")
 
 
-async def setlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def setreport_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id
     if not thread_id:
-        await update.message.reply_text("❌ Напишите /setlog внутри нужной темы Telegram-группы.")
-        return
-    set_setting(f"log_topic:{update.effective_chat.id}", str(thread_id))
-    set_setting("log_chat_id", str(update.effective_chat.id))
-    await update.message.reply_text("✅ Эта тема назначена логом задач.")
-
-
-async def setreports_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    thread_id = update.message.message_thread_id
-    if not thread_id:
-        await update.message.reply_text("❌ Напишите /setreports внутри нужной темы Telegram-группы.")
+        await update.message.reply_text("Напишите /setreport внутри темы, куда нужно присылать месячные отчеты.")
         return
     set_setting(f"reports_topic:{update.effective_chat.id}", str(thread_id))
     set_setting("reports_chat_id", str(update.effective_chat.id))
-    await update.message.reply_text("✅ Эта тема назначена темой отчётов.")
+    await update.message.reply_text("Готово, сюда будут приходить месячные отчеты.")
 
 
 async def setdaily_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if not chat:
-        await update.message.reply_text("❌ Не удалось определить чат для утренних задач.")
+        await update.message.reply_text("Не удалось определить чат для утренних задач.")
         return
     thread_id = update.message.message_thread_id
     set_setting("daily_chat_id", str(chat.id))
@@ -2297,9 +2265,6 @@ async def fixdeadline_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def deadline_alert_job(context: ContextTypes.DEFAULT_TYPE):
-    log_chat_id = get_log_chat_id()
-    if not log_chat_id:
-        return
     current_msk = now_msk()
     with db() as conn:
         rows = conn.execute(
@@ -2316,24 +2281,35 @@ async def deadline_alert_job(context: ContextTypes.DEFAULT_TYPE):
     if not rows:
         return
 
-    topic = get_setting(f"log_topic:{log_chat_id}")
     for r in rows:
+        source = task_source_message(r["id"])
         notified_user = r["accepted_by"] or r["created_by"]
         responsible_line = f"Отметка: {html.escape(notified_user)}"
         if not r["accepted_by"]:
             responsible_line = f"Исполнитель не назначен.\nОтметка постановщика: {html.escape(notified_user)}"
         text = (
-            f"<b>⛔ Срок нарушен по задаче #{r['id']}</b>\n\n"
+            f"<b>Блин, задача #{r['id']} просрочилась.</b>\n\n"
             f"<b>{html.escape(r['title'])}</b>\n"
             f"Дедлайн: {fmt_dt(r['deadline'])}\n"
             f"Текущее время по Москве: {current_msk.strftime(DATETIME_FMT)}\n"
             f"Статус: {html.escape(r['status'])}\n"
-            f"{responsible_line}"
+            f"{responsible_line}\n\n"
+            f"Нужно поднажать и закрыть её, либо изменить срок командой:\n"
+            f"<code>/retask {r['id']} (дата/время) (описание)</code>"
         )
+        if not source:
+            logger.warning("Deadline alert skipped for task %s: source message not found", r["id"])
+            with db() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO deadline_alerts(task_id,alerted_at,notified_user) VALUES(?,?,?)",
+                    (r["id"], now_iso(), notified_user),
+                )
+            log_action(r["id"], "deadline_overdue_no_source", notified_user, "deadline breached; source message not found", r["status"], r["status"])
+            continue
         try:
             await context.bot.send_message(
-                chat_id=log_chat_id,
-                message_thread_id=int(topic) if topic else None,
+                chat_id=source["chat_id"],
+                message_thread_id=int(source["thread_id"]) if source["thread_id"] else None,
                 text=text,
                 parse_mode=ParseMode.HTML,
             )
@@ -2399,7 +2375,7 @@ async def daily_tasks_job(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=int(chat_id),
             message_thread_id=int(topic) if topic else None,
-            text=f"❌ Не удалось собрать задачи на сегодня: {reason}",
+            text=f"Пока не удалось собрать задачи на сегодня: {reason}",
         )
         return
 
@@ -2518,7 +2494,7 @@ async def monthly_job(context: ContextTypes.DEFAULT_TYPE):
         data, filename = build_report_zip(month, payload, rows)
         file_obj = io.BytesIO(data)
         file_obj.name = filename
-        text = report_summary_text(month, payload)
+        text = monthly_report_caption(month, payload)
         await context.bot.send_document(
             chat_id=int(chat_id),
             message_thread_id=int(topic) if topic else None,
@@ -2559,10 +2535,10 @@ def main() -> None:
         ("backup", backup_cmd), ("storage", storage_cmd),
         ("task", task_cmd), ("retask", retask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
         ("tasks", tasks_cmd), ("note", note_cmd),
-        ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd), ("history", history_cmd),
+        ("stats", stats_cmd), ("report", report_cmd), ("top", top_cmd), ("history", history_cmd),
         ("add", add_cmd), ("remove", remove_cmd), ("designers", designers_cmd),
         ("smena", smena_cmd), ("online", online_cmd), ("swap", swap_cmd), ("clearswap", clearswap_cmd),
-        ("setlog", setlog_cmd), ("setreports", setreports_cmd), ("setdaily", setdaily_cmd),
+        ("setreport", setreport_cmd), ("setdaily", setdaily_cmd),
         ("fixquality", fixquality_cmd), ("fixdeadline", fixdeadline_cmd),
     ]
     for name, fn in handlers:
@@ -2579,7 +2555,7 @@ def main() -> None:
     app.job_queue.run_repeating(meeting_reminders_job, interval=60 * 5, first=45)
     app.job_queue.run_daily(auto_shift_reassign_job, time=dt_time(hour=0, minute=0, tzinfo=MSK))
     app.job_queue.run_daily(daily_tasks_job, time=dt_time(hour=9, minute=0, tzinfo=MSK))
-    app.job_queue.run_repeating(monthly_job, interval=60 * 60 * 6, first=10)
+    app.job_queue.run_daily(monthly_job, time=dt_time(hour=8, minute=0, tzinfo=MSK))
     app.run_polling(allowed_updates=ALLOWED_UPDATES)
 
 
