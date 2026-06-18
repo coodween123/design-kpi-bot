@@ -379,8 +379,7 @@ COMMAND_HELP = {
     "smena": "🔷 <code>/smena (дата) (@designer)</code> — задать старт графика 2/2",
     "swap": "🔷 <code>/swap (дата) (@designer) (причина)</code> — назначить подмену",
     "clearswap": "🔷 <code>/clearswap (дата)</code> — отменить подмену",
-    "setlog": "🔷 <code>/setlog</code> — назначить текущую тему логом задач",
-    "setreports": "🔷 <code>/setreports</code> — назначить текущую тему отчетами",
+    "setreport": "🔷 <code>/setreport</code> — назначить текущую тему отчетами",
     "setdaily": "🔷 <code>/setdaily</code> — назначить текущий чат или тему для утренних задач",
     "fixquality": "🔷 <code>/fixquality (ID) (0/1)</code> — исправить качество: 0 до 3 правок, 1 больше 3 правок",
     "fixdeadline": "🔷 <code>/fixdeadline (ID) (0/1)</code> — исправить срок: 0 в срок, 1 просрочено",
@@ -390,7 +389,7 @@ MAIN_HELP_COMMANDS = [
     "help", "task", "retask", "ok", "done", "reassign", "rework", "tasks",
     "note", "stats", "report", "top", "history", "online", "time", "sobranie",
     "backup", "storage", "add", "remove", "designers", "smena", "swap", "clearswap",
-    "setlog", "setreports", "setdaily", "fixquality", "fixdeadline",
+    "setreport", "setdaily", "fixquality", "fixdeadline",
 ]
 
 HELP_GROUPS = [
@@ -398,7 +397,7 @@ HELP_GROUPS = [
     ("Задачи", ["task", "retask", "ok", "done", "reassign", "rework", "tasks", "note"]),
     ("Статистика", ["stats", "report", "top", "history"]),
     ("График", ["online", "designers", "smena", "swap", "clearswap"]),
-    ("Настройки", ["backup", "storage", "add", "remove", "setlog", "setreports", "setdaily", "fixquality", "fixdeadline"]),
+    ("Настройки", ["backup", "storage", "add", "remove", "setreport", "setdaily", "fixquality", "fixdeadline"]),
 ]
 
 
@@ -731,6 +730,17 @@ def task_source_link(task_id: int) -> Optional[str]:
     if not row:
         return None
     return message_link(row["chat_id"], row["message_id"])
+
+
+def task_source_message(task_id: int):
+    with db() as conn:
+        return conn.execute(
+            """SELECT chat_id, message_id, thread_id FROM task_messages
+               WHERE task_id=? AND message_type='task_source'
+               ORDER BY id ASC
+               LIMIT 1""",
+            (task_id,),
+        ).fetchone()
 
 
 async def react_to_message(context: ContextTypes.DEFAULT_TYPE, message, emoji: str = "👍") -> bool:
@@ -1604,16 +1614,6 @@ async def task_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
     remember_task_message(task_id, reply_msg, "task_reply")
-    log_msg = await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>✅ Создана задача #{task_id}</b>\n\n"
-        f"<b>{html.escape(title)}</b>\n"
-        f"Дедлайн: {deadline.strftime(DATETIME_FMT)}\n"
-        f"Автор: {html.escape(creator)}\n\n"
-        f"{html.escape(desc)}",
-    )
-    remember_task_message(task_id, log_msg, "task_log")
 
 
 async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1675,15 +1675,6 @@ async def retask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Дедлайн: {new_deadline.strftime(DATETIME_FMT)}"
         f"{deadline_status}"
     )
-    await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>✏️ Изменена задача #{task_id}</b>\n"
-        f"Кто изменил: {html.escape(actor)}\n"
-        f"Название: {html.escape(row['title'])} → {html.escape(new_title)}\n"
-        f"Дедлайн: {html.escape(old_deadline)} → {new_deadline.strftime(DATETIME_FMT)}",
-    )
-
 
 async def ok_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args or not context.args[0].isdigit():
@@ -1777,14 +1768,6 @@ async def reassign_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_action(task_id, "reassign", actor, f"{old} -> {new_user}", row["status"], row["status"])
     msg = f"🔄 Задача #{task_id} переназначена.\n\nСтарый исполнитель: {old}\nНовый исполнитель: {new_user}"
     await update.message.reply_text(msg)
-    await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>🔄 Переназначение задачи #{task_id}</b>\n"
-        f"Старый: {html.escape(old)}\n"
-        f"Новый: {html.escape(new_user)}\n"
-        f"Кто изменил: {html.escape(actor)}",
-    )
 
 
 async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1809,14 +1792,6 @@ async def done_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     log_action(task_id, "done", actor, f"quality={qflag}; on_time={on_time}", row["status"], STATUSES["done"])
     await update.message.reply_text(f"🟢 Задача #{task_id} завершена. Срок: {deadline_status}. Правки: {'более 3' if qflag else 'до 3'}.")
-    await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>🟢 Завершена задача #{task_id}</b>\n"
-        f"Срок: {deadline_status}\n"
-        f"Правки: {'более 3' if qflag else 'до 3'}\n"
-        f"Закрыл: {html.escape(actor)}",
-    )
 
 
 async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1866,15 +1841,6 @@ async def rework_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Новый дедлайн: {new_deadline.strftime(DATETIME_FMT)}\n"
         f"Исполнитель сегодняшней смены: {designer}{shift_note}\n"
         f"Причина: {reason}"
-    )
-    await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>🟠 Доработка задачи #{task_id}</b>\n"
-        f"Новый дедлайн: {new_deadline.strftime(DATETIME_FMT)}\n"
-        f"Исполнитель сегодняшней смены: {html.escape(designer)}{shift_note}\n"
-        f"Причина: {html.escape(reason)}\n"
-        f"Кто отправил: {html.escape(actor)}",
     )
 
 
@@ -2260,15 +2226,6 @@ async def swap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("INSERT INTO shift_overrides(date,designer,reason,created_at,created_by) VALUES(?,?,?,?,?) ON CONFLICT(date) DO UPDATE SET designer=excluded.designer, reason=excluded.reason, created_at=excluded.created_at, created_by=excluded.created_by", (fmt_date(d), designer, reason, now_iso(), user_name(update)))
     await update.message.reply_text(f"🔄 Подмена назначена.\n\nДата: {fmt_date(d)}\nВместо: {old}\nРаботает: {designer}\nПричина: {reason}")
-    await send_log(
-        context,
-        update.effective_chat.id,
-        f"<b>🔄 Назначена подмена</b>\n"
-        f"Дата: {fmt_date(d)}\n"
-        f"Вместо: {html.escape(old or '—')}\n"
-        f"Работает: {html.escape(designer)}\n"
-        f"Причина: {html.escape(reason)}",
-    )
 
 
 async def clearswap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2283,7 +2240,6 @@ async def clearswap_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with db() as conn:
         conn.execute("DELETE FROM shift_overrides WHERE date=?", (fmt_date(d),))
     await update.message.reply_text(f"↩️ Подмена на {fmt_date(d)} отменена. Возвращён стандартный график.")
-    await send_log(context, update.effective_chat.id, f"<b>↩️ Подмена отменена</b>\nДата: {fmt_date(d)}\nВозвращён стандартный график.")
 
 
 async def setlog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
