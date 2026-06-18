@@ -5,9 +5,12 @@ import json
 import html
 import re
 import sqlite3
+import shutil
+import tempfile
 import zipfile
 import logging
 from datetime import datetime, date, timedelta, time as dt_time
+from pathlib import Path
 from zoneinfo import ZoneInfo
 from collections import Counter, defaultdict
 from typing import Any, Optional, Tuple, List
@@ -21,7 +24,69 @@ try:
 except ImportError:
     MessageReactionHandler = None
 
-DB_PATH = os.getenv("DB_PATH", "design_kpi_bot.sqlite3")
+APP_HOME = Path(os.getenv("DESIGN_KPI_HOME", Path.home() / "Documents" / "design-kpi-bot")).expanduser()
+DATA_DIR = Path(os.getenv("DATA_DIR", APP_HOME / "data")).expanduser()
+BACKUP_DIR = Path(os.getenv("BACKUP_DIR", APP_HOME / "backups")).expanduser()
+DB_FILENAME = "design_kpi_bot.sqlite3"
+
+
+def ensure_storage_dirs() -> None:
+    global DATA_DIR, BACKUP_DIR
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        return
+    except OSError:
+        fallback_home = Path(__file__).resolve().parent / "design-kpi-bot-data"
+        DATA_DIR = fallback_home / "data"
+        BACKUP_DIR = fallback_home / "backups"
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        return
+    except OSError:
+        fallback_home = Path(__file__).resolve().parent
+        DATA_DIR = fallback_home
+        BACKUP_DIR = fallback_home
+
+
+def copy_sqlite_files(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    for suffix in ("", "-wal", "-shm"):
+        source_file = Path(f"{source}{suffix}")
+        if source_file.exists():
+            shutil.copy2(source_file, Path(f"{target}{suffix}"))
+
+
+def resolve_db_path() -> str:
+    env_path = os.getenv("DB_PATH")
+    if env_path:
+        path = Path(env_path).expanduser()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    ensure_storage_dirs()
+    target = DATA_DIR / DB_FILENAME
+    if target.exists():
+        return str(target)
+
+    legacy_candidates = [
+        Path.cwd() / DB_FILENAME,
+        Path(__file__).resolve().parent / DB_FILENAME,
+    ]
+    seen: set[Path] = set()
+    for legacy in legacy_candidates:
+        legacy = legacy.resolve()
+        if legacy in seen or legacy == target:
+            continue
+        seen.add(legacy)
+        if legacy.exists():
+            copy_sqlite_files(legacy, target)
+            break
+    return str(target)
+
+
+DB_PATH = resolve_db_path()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATE_FMT = "%d.%m.%Y"
 DATETIME_FMT = "%d.%m.%Y %H:%M"
@@ -68,6 +133,94 @@ def now_msk() -> datetime:
 
 def now_iso() -> str:
     return now_msk().isoformat(timespec="seconds")
+
+
+def backup_database_once_per_day() -> None:
+    enabled = os.getenv("DB_BACKUP_ON_START", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return
+
+    source = Path(DB_PATH)
+    if not source.exists():
+        return
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    target = BACKUP_DIR / f"design_kpi_bot_{now_msk().strftime('%Y-%m-%d')}.sqlite3"
+    if target.exists():
+        return
+
+    source_conn = None
+    target_conn = None
+    try:
+        source_conn = sqlite3.connect(str(source))
+        target_conn = sqlite3.connect(str(target))
+        source_conn.backup(target_conn)
+    except Exception as e:
+        logger.warning("Cannot create database backup: %s", e)
+    finally:
+        if target_conn:
+            target_conn.close()
+        if source_conn:
+            source_conn.close()
+
+
+def create_database_snapshot(target: Path) -> None:
+    source = Path(DB_PATH)
+    if not source.exists():
+        raise FileNotFoundError(f"Database not found: {source}")
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source_conn = None
+    target_conn = None
+    try:
+        source_conn = sqlite3.connect(str(source))
+        target_conn = sqlite3.connect(str(target))
+        source_conn.backup(target_conn)
+    finally:
+        if target_conn:
+            target_conn.close()
+        if source_conn:
+            source_conn.close()
+
+
+def build_database_backup_zip() -> tuple[bytes, str]:
+    created_at = now_msk()
+    stamp = created_at.strftime("%Y-%m-%d_%H-%M-%S")
+    sqlite_name = f"design_kpi_bot_backup_{stamp}.sqlite3"
+    zip_name = f"design_kpi_bot_backup_{stamp}.zip"
+
+    with tempfile.TemporaryDirectory() as tmp:
+        snapshot_path = Path(tmp) / sqlite_name
+        create_database_snapshot(snapshot_path)
+
+        info = {
+            "created_at_msk": created_at.isoformat(timespec="seconds"),
+            "timezone": TZ_NAME,
+            "source_db_path": str(Path(DB_PATH)),
+            "sqlite_file": sqlite_name,
+            "restore_note": "Stop the bot, place this sqlite file as design_kpi_bot.sqlite3, set DB_PATH to it, then start the bot.",
+        }
+
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.write(snapshot_path, sqlite_name)
+            zf.writestr("backup_info.json", json.dumps(info, ensure_ascii=False, indent=2))
+        archive.seek(0)
+        return archive.getvalue(), zip_name
+
+
+def storage_text() -> str:
+    db_path = Path(DB_PATH)
+    db_exists = db_path.exists()
+    size = db_path.stat().st_size if db_exists else 0
+    return (
+        "<b>Хранение базы</b>\n\n"
+        f"База задач:\n<code>{html.escape(str(db_path))}</code>\n"
+        f"Размер: {size} байт\n\n"
+        f"Автокопии при запуске:\n<code>{html.escape(str(BACKUP_DIR))}</code>\n\n"
+        "Чтобы данные не пропали при переезде, перенеси файл базы или backup из /backup "
+        "и укажи этот путь в переменной <code>DB_PATH</code>."
+    )
 
 
 def parse_dt(value: str) -> datetime:
@@ -209,6 +362,8 @@ COMMAND_HELP = {
     "online": "🔷 <code>/online (дата или месяц или week)</code> — показать кто работает сегодня, в конкретный день, за месяц или за неделю",
     "time": "🔷 <code>/time</code> — показать текущее время по Москве",
     "sobranie": "🔷 <code>/sobranie (дата/время)</code> — запланировать собрание и напоминания",
+    "backup": "🔷 <code>/backup</code> — скачать резервную копию базы zip-файлом",
+    "storage": "🔷 <code>/storage</code> — показать где хранится база и автокопии",
     "add": "🔷 <code>/add (@username)</code> — добавить дизайнера",
     "remove": "🔷 <code>/remove (@username)</code> — убрать дизайнера из активных",
     "designers": "🔷 <code>/designers</code> — показать активных дизайнеров",
@@ -225,7 +380,7 @@ COMMAND_HELP = {
 MAIN_HELP_COMMANDS = [
     "help", "task", "retask", "ok", "done", "reassign", "rework", "tasks",
     "note", "stats", "report", "top", "history", "online", "time", "sobranie",
-    "add", "remove", "designers", "smena", "swap", "clearswap",
+    "backup", "storage", "add", "remove", "designers", "smena", "swap", "clearswap",
     "setlog", "setreports", "setdaily", "fixquality", "fixdeadline",
 ]
 
@@ -234,7 +389,7 @@ HELP_GROUPS = [
     ("Задачи", ["task", "retask", "ok", "done", "reassign", "rework", "tasks", "note"]),
     ("Статистика", ["stats", "report", "top", "history"]),
     ("График", ["online", "designers", "smena", "swap", "clearswap"]),
-    ("Настройки", ["add", "remove", "setlog", "setreports", "setdaily", "fixquality", "fixdeadline"]),
+    ("Настройки", ["backup", "storage", "add", "remove", "setlog", "setreports", "setdaily", "fixquality", "fixdeadline"]),
 ]
 
 
@@ -1250,6 +1405,8 @@ async def setup_commands(app: Application):
         BotCommand("online", "(дата или месяц или week) кто работает"),
         BotCommand("time", "время по Москве"),
         BotCommand("sobranie", "(дата/время) собрание"),
+        BotCommand("backup", "скачать резервную копию базы"),
+        BotCommand("storage", "где хранится база"),
         BotCommand("add", "(@username) добавить дизайнера"),
         BotCommand("remove", "(@username) удалить дизайнера"),
         BotCommand("designers", "активные дизайнеры"),
@@ -1262,6 +1419,30 @@ async def setup_commands(app: Application):
         BotCommand("fixquality", "(ID) (0/1) исправить качество"),
         BotCommand("fixdeadline", "(ID) (0/1) исправить срок"),
     ])
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data, filename = build_database_backup_zip()
+    except Exception as e:
+        logger.warning("Manual backup failed: %s", e)
+        await update.message.reply_text("Не получилось сделать backup базы. Проверьте, что файл базы существует и доступен боту.")
+        return
+
+    file_obj = io.BytesIO(data)
+    file_obj.name = filename
+    await update.message.reply_document(
+        document=file_obj,
+        filename=filename,
+        caption=(
+            "Готово, это резервная копия базы.\n"
+            "Внутри zip лежит актуальный SQLite-снимок со всеми задачами, статистикой, графиком и настройками."
+        ),
+    )
+
+
+async def storage_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(storage_text(), parse_mode=ParseMode.HTML)
 
 
 async def time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2342,11 +2523,13 @@ def logged_command_handler(name: str, fn) -> CommandHandler:
 def main() -> None:
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не найден. Добавьте переменную окружения BOT_TOKEN.")
+    backup_database_once_per_day()
     init_db()
     app = Application.builder().token(BOT_TOKEN).post_init(setup_commands).build()
 
     handlers = [
         ("start", start), ("help", help_cmd), ("time", time_cmd), ("sobranie", sobranie_cmd),
+        ("backup", backup_cmd), ("storage", storage_cmd),
         ("task", task_cmd), ("retask", retask_cmd), ("ok", ok_cmd), ("done", done_cmd), ("rework", rework_cmd), ("reassign", reassign_cmd),
         ("tasks", tasks_cmd), ("note", note_cmd),
         ("stats", stats_cmd), ("report", report_cmd), ("month_report", report_cmd), ("top", top_cmd), ("history", history_cmd),
