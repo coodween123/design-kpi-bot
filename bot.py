@@ -98,9 +98,78 @@ def db() -> sqlite3.Connection:
     return conn
 
 
+def table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return row is not None
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    if not table_exists(conn, table):
+        return set()
+    return {row["name"] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+
+
+def legacy_table_name(conn: sqlite3.Connection, table: str) -> str:
+    stamp = datetime.now(MSK).strftime("%Y%m%d_%H%M%S")
+    base_name = f"{table}_legacy_{stamp}"
+    name = base_name
+    counter = 1
+
+    while table_exists(conn, name):
+        name = f"{base_name}_{counter}"
+        counter += 1
+
+    return name
+
+
+def archive_incompatible_table(
+    conn: sqlite3.Connection,
+    table: str,
+    required_columns: set[str],
+) -> None:
+    if not table_exists(conn, table):
+        return
+
+    columns = table_columns(conn, table)
+    missing_columns = required_columns - columns
+    if not missing_columns:
+        return
+
+    legacy_name = legacy_table_name(conn, table)
+    logger.warning(
+        "Renaming incompatible table %s to %s. Missing columns: %s",
+        table,
+        legacy_name,
+        ", ".join(sorted(missing_columns)),
+    )
+    conn.execute(f'ALTER TABLE "{table}" RENAME TO "{legacy_name}"')
+
+
 def init_db() -> None:
     with db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
+        archive_incompatible_table(conn, "users", {"user_id", "chat_id", "created_at", "last_seen_at"})
+        archive_incompatible_table(conn, "settings", {"key", "value"})
+        archive_incompatible_table(
+            conn,
+            "tasks",
+            {
+                "user_id",
+                "title",
+                "completed_at",
+                "completed_month",
+                "on_time",
+                "designer_fault_rework",
+                "created_at",
+                "updated_at",
+            },
+        )
+        archive_incompatible_table(conn, "monthly_reports", {"user_id", "month", "sent_at"})
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_user_month")
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_user_completed_at")
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS users (
