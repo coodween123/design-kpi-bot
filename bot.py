@@ -315,16 +315,6 @@ def update_task_field(user_id: int, task_id: int, **fields: Any) -> Optional[str
     return updated["completed_month"] if updated else row["completed_month"]
 
 
-def delete_task(user_id: int, task_id: int) -> Optional[str]:
-    row = task_by_id(user_id, task_id)
-    if not row:
-        return None
-    month = row["completed_month"]
-    with db() as conn:
-        conn.execute("DELETE FROM tasks WHERE user_id=? AND id=?", (user_id, task_id))
-    return month
-
-
 def tasks_for_month(user_id: int, month: str):
     with db() as conn:
         return conn.execute(
@@ -499,10 +489,6 @@ def updated_caption(task_id: int, month: str, rows) -> str:
     return f"✅ <b>Запись #{task_id} обновлена и внесена в таблицу.</b>\n\n{month_progress_text(month, rows)}{premium_warning_text(rows)}"
 
 
-def deleted_caption(task_id: int, month: str, rows) -> str:
-    return f"Готово, запись #{task_id} удалена из таблицы.\n\n{month_progress_text(month, rows)}"
-
-
 def monthly_caption(month: str, rows) -> str:
     stats = calc_kpi(rows)
     return (
@@ -628,30 +614,6 @@ def download_keyboard() -> InlineKeyboardMarkup:
             [InlineKeyboardButton("Предыдущий месяц", callback_data="download:previous")],
             [InlineKeyboardButton("За все время", callback_data="download:all")],
         ]
-    )
-
-
-def edit_keyboard(task_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("Название", callback_data=f"edit:{task_id}:title")],
-            [InlineKeyboardButton("Срок", callback_data=f"edit:{task_id}:on_time")],
-            [InlineKeyboardButton("Правки", callback_data=f"edit:{task_id}:fault")],
-            [InlineKeyboardButton("Дата выполнения", callback_data=f"edit:{task_id}:date")],
-            [InlineKeyboardButton("Удалить запись", callback_data=f"edit:{task_id}:delete")],
-            [InlineKeyboardButton("Отмена", callback_data="edit:cancel")],
-        ]
-    )
-
-
-def edit_task_text(row) -> str:
-    return (
-        f"<b>Запись #{row['id']}</b>\n\n"
-        f"Задача: {html.escape(row['title'])}\n"
-        f"Дата выполнения: {fmt_dt(row['completed_at'])} МСК\n"
-        f"Выполнена в срок: {yes_no(row['on_time'] == 1).lower()}\n"
-        f"Правки по моей вине: {yes_no(row['designer_fault_rework'] == 1).lower()}\n\n"
-        f"Что исправить?"
     )
 
 
@@ -881,7 +843,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text(
         "Привет! Здесь можно вести личный учет выполненных задач и KPI.\n\n"
-        "Добавляй задачи кнопкой ниже, а я буду сразу пересобирать Excel-таблицу.",
+        "Добавляй задачи кнопкой ниже, а Excel-таблицу можно скачать по запросу.",
         reply_markup=MAIN_MENU,
     )
 
@@ -946,6 +908,7 @@ async def download_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def setup_commands(app: Application) -> None:
+    await app.bot.delete_my_commands()
     await app.bot.set_my_commands(
         [
             BotCommand("start", "открыть меню"),
@@ -1021,51 +984,7 @@ async def process_edit_id(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     if not text.strip().isdigit():
         await update.message.reply_text("Напишите номер записи цифрой.")
         return
-    task_id = int(text.strip())
-    row = task_by_id(update.effective_user.id, task_id)
-    if not row:
-        await update.message.reply_text("Не нашел запись с таким номером.")
-        return
-    context.user_data["state"] = None
-    await update.message.reply_text(edit_task_text(row), parse_mode=ParseMode.HTML, reply_markup=edit_keyboard(task_id))
-
-
-async def process_edit_title(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    task_id = context.user_data.get("edit_task_id")
-    if not task_id:
-        await start_edit(update, context)
-        return
-    month = update_task_field(update.effective_user.id, task_id, title=text.strip())
-    context.user_data.clear()
-    if not month:
-        await update.message.reply_text("Запись уже не найдена.")
-        return
-    rows = tasks_for_month(update.effective_user.id, month)
-    await update.message.reply_text(
-        updated_caption(int(task_id), month, rows),
-        parse_mode=ParseMode.HTML,
-    )
-
-
-async def process_edit_date(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
-    task_id = context.user_data.get("edit_task_id")
-    if not task_id:
-        await start_edit(update, context)
-        return
-    dt = parse_user_datetime(text)
-    if not dt:
-        await update.message.reply_text("Не понял дату. Напишите так: 20.06.2026 18:45")
-        return
-    month = update_task_field(update.effective_user.id, task_id, completed_at=dt)
-    context.user_data.clear()
-    if not month:
-        await update.message.reply_text("Запись уже не найдена.")
-        return
-    rows = tasks_for_month(update.effective_user.id, month)
-    await update.message.reply_text(
-        updated_caption(int(task_id), month, rows),
-        parse_mode=ParseMode.HTML,
-    )
+    await start_full_edit(update, context, int(text.strip()))
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1096,12 +1015,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     if state == "edit_id":
         await process_edit_id(update, context, text)
-        return
-    if state == "edit_title":
-        await process_edit_title(update, context, text)
-        return
-    if state == "edit_date":
-        await process_edit_date(update, context, text)
         return
 
     if text == BTN_ADD:
@@ -1329,103 +1242,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         else:
             rows = all_tasks(user_id)
             await send_report_file(context.bot, chat_id, user_id, None, "📥 Таблица за все время.", all_time=True)
-        return
-
-    if data == "edit:cancel":
-        context.user_data.clear()
-        await query.edit_message_text("Исправление отменено.")
-        return
-
-    if data.startswith("edit:"):
-        parts = data.split(":")
-        if len(parts) != 3:
-            return
-        task_id = int(parts[1])
-        action = parts[2]
-        row = task_by_id(user_id, task_id)
-        if not row:
-            await query.edit_message_text("Запись уже не найдена.")
-            return
-        if action == "title":
-            context.user_data["state"] = "edit_title"
-            context.user_data["edit_task_id"] = task_id
-            await query.edit_message_text("Введите новое название задачи.")
-            return
-        if action == "date":
-            context.user_data["state"] = "edit_date"
-            context.user_data["edit_task_id"] = task_id
-            await query.edit_message_text("Введите новую дату и время по МСК.\nНапример: 20.06.2026 18:45")
-            return
-        if action == "on_time":
-            await query.edit_message_text(
-                "Выполнена в срок?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("✅ Да", callback_data=f"edit_set:{task_id}:on_time:1"),
-                            InlineKeyboardButton("❌ Нет", callback_data=f"edit_set:{task_id}:on_time:0"),
-                        ]
-                    ]
-                ),
-            )
-            return
-        if action == "fault":
-            await query.edit_message_text(
-                "Были правки по моей вине?",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            InlineKeyboardButton("✅ Нет", callback_data=f"edit_set:{task_id}:fault:0"),
-                            InlineKeyboardButton("❌ Да", callback_data=f"edit_set:{task_id}:fault:1"),
-                        ]
-                    ]
-                ),
-            )
-            return
-        if action == "delete":
-            await query.edit_message_text(
-                f"Удалить запись #{task_id}? Это нельзя будет отменить.",
-                reply_markup=InlineKeyboardMarkup(
-                    [
-                        [InlineKeyboardButton("Да, удалить", callback_data=f"delete:{task_id}:yes")],
-                        [InlineKeyboardButton("Нет, оставить", callback_data=f"delete:{task_id}:no")],
-                    ]
-                ),
-            )
-            return
-
-    if data.startswith("edit_set:"):
-        _, task_id_s, field, value_s = data.split(":")
-        task_id = int(task_id_s)
-        if field == "on_time":
-            month = update_task_field(user_id, task_id, on_time=value_s == "1")
-        else:
-            month = update_task_field(user_id, task_id, designer_fault_rework=value_s == "1")
-        if not month:
-            await query.edit_message_text("Запись уже не найдена.")
-            return
-        rows = tasks_for_month(user_id, month)
-        await query.edit_message_text(
-            updated_caption(task_id, month, rows),
-            parse_mode=ParseMode.HTML,
-        )
-        return
-
-    if data.startswith("delete:"):
-        _, task_id_s, answer = data.split(":")
-        task_id = int(task_id_s)
-        if answer == "no":
-            await query.edit_message_text("Хорошо, запись оставлена без изменений.")
-            return
-        month = delete_task(user_id, task_id)
-        if not month:
-            await query.edit_message_text("Запись уже не найдена.")
-            return
-        rows = tasks_for_month(user_id, month)
-        await query.edit_message_text(
-            deleted_caption(task_id, month, rows),
-            parse_mode=ParseMode.HTML,
-        )
         return
 
 
