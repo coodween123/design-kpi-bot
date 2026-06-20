@@ -44,7 +44,8 @@ KPI_QUALITY_MAX = 5_000
 BTN_ADD = "➕ Добавить задачу"
 BTN_KPI = "📊 KPI текущего месяца"
 BTN_LATEST = "📋 Последние задачи"
-BTN_EDIT = "✏️ Исправить запись"
+BTN_EDIT = "✏️ Исправить / удалить"
+BTN_EDIT_LEGACY = "✏️ Исправить запись"
 BTN_DOWNLOAD = "📥 Скачать таблицу"
 
 MAIN_MENU = ReplyKeyboardMarkup(
@@ -55,6 +56,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+
+MAIN_MENU_TEXTS = {BTN_ADD, BTN_KPI, BTN_LATEST, BTN_EDIT, BTN_EDIT_LEGACY, BTN_DOWNLOAD}
 
 MONTHS_RU = {
     1: "январь",
@@ -350,6 +353,15 @@ def insert_task(user_id: int, title: str, completed_at: datetime, on_time: bool,
 def task_by_id(user_id: int, task_id: int):
     with db() as conn:
         return conn.execute("SELECT * FROM tasks WHERE user_id=? AND id=?", (user_id, task_id)).fetchone()
+
+
+def delete_task(user_id: int, task_id: int):
+    row = task_by_id(user_id, task_id)
+    if not row:
+        return None
+    with db() as conn:
+        conn.execute("DELETE FROM tasks WHERE user_id=? AND id=?", (user_id, task_id))
+    return row
 
 
 def update_task_field(user_id: int, task_id: int, **fields: Any) -> Optional[str]:
@@ -656,6 +668,25 @@ def draft_edit_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def manage_entry_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✏️ Редактировать", callback_data="manage:edit")],
+            [InlineKeyboardButton("🗑 Удалить", callback_data="manage:delete")],
+            [InlineKeyboardButton("Отмена", callback_data="manage:cancel")],
+        ]
+    )
+
+
+def delete_confirm_keyboard(task_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Удалить запись", callback_data=f"delete:confirm:{task_id}")],
+            [InlineKeyboardButton("Оставить", callback_data="delete:cancel")],
+        ]
+    )
+
+
 def bool_keyboard(prefix: str, yes_text: str = "✅ Да", no_text: str = "❌ Нет") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -775,13 +806,29 @@ def report_workbook(
         ["С правками по моей вине", stats["fault"], percent_text(stats["fault_pct"]), money(stats["quality_kpi"])],
         ["Итоговая выплата", "—", "—", money(stats["total_kpi"])],
     ]
+    summary_rows.extend(
+        [
+            [],
+            ["Список выполненных задач"],
+            ["№ задачи", "Задача", "Дата и время по МСК", "В срок?", "Были правки?"],
+        ]
+    )
+    for row in rows:
+        summary_rows.append(
+            [
+                row["id"],
+                row["title"],
+                fmt_dt(row["completed_at"]),
+                yes_no(row["on_time"] == 1),
+                yes_no(row["designer_fault_rework"] == 1),
+            ]
+        )
 
-    task_rows = [["ID", "№ в таблице", "Название задачи", "Дата и время по МСК", "В срок выполнено", "Правки по моей вине"]]
-    for idx, row in enumerate(rows, start=1):
+    task_rows = [["№ задачи", "Название задачи", "Дата и время по МСК", "В срок выполнено", "Правки по моей вине"]]
+    for row in rows:
         task_rows.append(
             [
                 row["id"],
-                idx,
                 row["title"],
                 fmt_dt(row["completed_at"]),
                 yes_no(row["on_time"] == 1),
@@ -867,12 +914,9 @@ async def start_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
-    context.user_data["state"] = "edit_id"
-    rows = latest_tasks(update.effective_user.id, 5)
     await update.message.reply_text(
-        latest_text(rows) + "\n\nВведите номер записи, которую нужно исправить.",
-        parse_mode=ParseMode.HTML,
-        reply_markup=MAIN_MENU,
+        "Что сделать с записью?",
+        reply_markup=manage_entry_keyboard(),
     )
 
 
@@ -893,16 +937,19 @@ async def start_full_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
 
 
 async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
     await update.message.reply_text("Какую таблицу скачать?", reply_markup=download_keyboard())
 
 
 async def show_current_kpi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
     month = current_month()
     rows = tasks_for_month(update.effective_user.id, month)
     await update.message.reply_text(kpi_text(month, rows), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
 
 
 async def show_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
     rows = latest_tasks(update.effective_user.id)
     await update.message.reply_text(latest_text(rows), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
 
@@ -925,7 +972,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/add — добавить задачу\n"
         "/kpi — KPI текущего месяца\n"
         "/latest — последние задачи\n"
-        "/edit — выбрать запись для исправления\n"
+        "/edit — исправить или удалить запись\n"
         "/edit ID — полностью обновить запись по номеру\n"
         "/download — скачать таблицу",
         parse_mode=ParseMode.HTML,
@@ -984,7 +1031,7 @@ async def setup_commands(app: Application) -> None:
             BotCommand("add", "добавить выполненную задачу"),
             BotCommand("kpi", "KPI текущего месяца"),
             BotCommand("latest", "последние задачи"),
-            BotCommand("edit", "исправить или обновить запись"),
+            BotCommand("edit", "исправить или удалить запись"),
             BotCommand("download", "скачать таблицу"),
             BotCommand("help", "помощь"),
         ]
@@ -1056,9 +1103,50 @@ async def process_edit_id(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     await start_full_edit(update, context, int(text.strip()))
 
 
+async def process_delete_id(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    if not text.strip().isdigit():
+        await update.message.reply_text("Напишите номер записи цифрой.")
+        return
+
+    task_id = int(text.strip())
+    row = task_by_id(update.effective_user.id, task_id)
+    if not row:
+        await update.message.reply_text("Не нашел запись с таким номером.", reply_markup=MAIN_MENU)
+        return
+
+    context.user_data["delete_task_id"] = task_id
+    await update.message.reply_text(
+        (
+            f"Удалить запись #{task_id}?\n\n"
+            f"Задача: {html.escape(row['title'])}\n"
+            f"Дата: {fmt_dt(row['completed_at'])}\n\n"
+            "Действие нельзя отменить."
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=delete_confirm_keyboard(task_id),
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_user(update)
     text = (update.message.text or "").strip()
+
+    if text in MAIN_MENU_TEXTS:
+        if text == BTN_ADD:
+            await start_add(update, context)
+        elif text == BTN_KPI:
+            context.user_data.clear()
+            await show_current_kpi(update, context)
+        elif text == BTN_LATEST:
+            context.user_data.clear()
+            await show_latest(update, context)
+        elif text in {BTN_EDIT, BTN_EDIT_LEGACY}:
+            await start_edit(update, context)
+        elif text == BTN_DOWNLOAD:
+            context.user_data.clear()
+            await start_download(update, context)
+        return
+
     state = context.user_data.get("state")
 
     if state == "add_title":
@@ -1085,19 +1173,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state == "edit_id":
         await process_edit_id(update, context, text)
         return
+    if state == "delete_id":
+        await process_delete_id(update, context, text)
+        return
 
-    if text == BTN_ADD:
-        await start_add(update, context)
-    elif text == BTN_KPI:
-        await show_current_kpi(update, context)
-    elif text == BTN_LATEST:
-        await show_latest(update, context)
-    elif text == BTN_EDIT:
-        await start_edit(update, context)
-    elif text == BTN_DOWNLOAD:
-        await start_download(update, context)
-    else:
-        await update.message.reply_text("Выберите действие в меню ниже.", reply_markup=MAIN_MENU)
+    await update.message.reply_text("Выберите действие в меню ниже.", reply_markup=MAIN_MENU)
 
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1107,6 +1187,58 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     data = query.data or ""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
+
+    if data == "manage:edit":
+        context.user_data.clear()
+        context.user_data["state"] = "edit_id"
+        rows = latest_tasks(user_id, 5)
+        await query.edit_message_text(
+            latest_text(rows) + "\n\nВведите номер записи, которую нужно исправить.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "manage:delete":
+        context.user_data.clear()
+        context.user_data["state"] = "delete_id"
+        rows = latest_tasks(user_id, 5)
+        await query.edit_message_text(
+            latest_text(rows) + "\n\nВведите номер записи, которую нужно удалить.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "manage:cancel":
+        context.user_data.clear()
+        await query.edit_message_text("Хорошо, ничего не меняем.")
+        return
+
+    if data.startswith("delete:confirm:"):
+        task_id = int(data.rsplit(":", 1)[1])
+        pending_task_id = context.user_data.get("delete_task_id")
+        if pending_task_id != task_id:
+            context.user_data.clear()
+            await query.edit_message_text("Удаление уже не активно. Если нужно удалить запись, начните заново.")
+            return
+
+        row = delete_task(user_id, task_id)
+        context.user_data.clear()
+        if not row:
+            await query.edit_message_text("Запись уже не найдена.")
+            return
+
+        month = row["completed_month"]
+        rows = tasks_for_month(user_id, month)
+        await query.edit_message_text(
+            f"Запись #{task_id} удалена.\n\n{month_progress_text(month, rows)}{premium_warning_text(rows)}",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "delete:cancel":
+        context.user_data.clear()
+        await query.edit_message_text("Удаление отменено.")
+        return
 
     if data.startswith("add_on_time:"):
         draft = context.user_data.get("draft", {})
