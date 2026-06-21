@@ -40,6 +40,8 @@ DATETIME_FMT = "%d.%m.%Y %H:%M"
 
 KPI_DEADLINE_MAX = 10_000
 KPI_QUALITY_MAX = 5_000
+STATUS_DONE = "done"
+STATUS_PENDING = "pending"
 
 BTN_ADD = "➕ Добавить задачу"
 BTN_KPI = "📊 KPI текущего месяца"
@@ -151,6 +153,11 @@ def archive_incompatible_table(
     conn.execute(f'ALTER TABLE "{table}" RENAME TO "{legacy_name}"')
 
 
+def ensure_task_status_column(conn: sqlite3.Connection) -> None:
+    if table_exists(conn, "tasks") and "status" not in table_columns(conn, "tasks"):
+        conn.execute(f"ALTER TABLE tasks ADD COLUMN status TEXT NOT NULL DEFAULT '{STATUS_DONE}'")
+
+
 def init_db() -> None:
     with db() as conn:
         conn.execute("PRAGMA journal_mode = WAL")
@@ -195,6 +202,7 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 completed_at TEXT NOT NULL,
                 completed_month TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'done',
                 on_time INTEGER NOT NULL,
                 designer_fault_rework INTEGER NOT NULL,
                 created_at TEXT NOT NULL,
@@ -213,6 +221,7 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_tasks_user_completed_at ON tasks(user_id, completed_at);
             """
         )
+        ensure_task_status_column(conn)
 
 
 def now_msk() -> datetime:
@@ -328,19 +337,34 @@ def is_owner(user_id: int) -> bool:
     return str(user_id) == (get_setting("owner_user_id") or "")
 
 
-def insert_task(user_id: int, title: str, completed_at: datetime, on_time: bool, fault_rework: bool) -> int:
+def task_status(row) -> str:
+    try:
+        return row["status"] or STATUS_DONE
+    except (KeyError, IndexError):
+        return STATUS_DONE
+
+
+def insert_task(
+    user_id: int,
+    title: str,
+    completed_at: datetime,
+    on_time: bool,
+    fault_rework: bool,
+    status: str = STATUS_DONE,
+) -> int:
     stamp = now_iso()
     with db() as conn:
         cur = conn.execute(
             """
-            INSERT INTO tasks(user_id,title,completed_at,completed_month,on_time,designer_fault_rework,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?)
+            INSERT INTO tasks(user_id,title,completed_at,completed_month,status,on_time,designer_fault_rework,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?)
             """,
             (
                 user_id,
                 title.strip(),
                 completed_at.isoformat(timespec="seconds"),
                 month_key(completed_at),
+                status,
                 1 if on_time else 0,
                 1 if fault_rework else 0,
                 stamp,
@@ -379,6 +403,9 @@ def update_task_field(user_id: int, task_id: int, **fields: Any) -> Optional[str
         args.append(completed_at.isoformat(timespec="seconds"))
         updates.append("completed_month=?")
         args.append(month_key(completed_at))
+    if "status" in fields:
+        updates.append("status=?")
+        args.append(fields["status"])
     if "on_time" in fields:
         updates.append("on_time=?")
         args.append(1 if fields["on_time"] else 0)
@@ -401,32 +428,41 @@ def tasks_for_month(user_id: int, month: str):
         return conn.execute(
             """
             SELECT * FROM tasks
-            WHERE user_id=? AND completed_month=?
+            WHERE user_id=? AND completed_month=? AND status=?
             ORDER BY completed_at ASC, id ASC
             """,
-            (user_id, month),
+            (user_id, month, STATUS_DONE),
         ).fetchall()
 
 
 def all_tasks(user_id: int):
     with db() as conn:
         return conn.execute(
-            "SELECT * FROM tasks WHERE user_id=? ORDER BY completed_at ASC, id ASC",
-            (user_id,),
+            "SELECT * FROM tasks WHERE user_id=? AND status=? ORDER BY completed_at ASC, id ASC",
+            (user_id, STATUS_DONE),
         ).fetchall()
 
 
 def latest_tasks(user_id: int, limit: int = 10):
     with db() as conn:
-        return conn.execute(
+        pending = conn.execute(
             """
             SELECT * FROM tasks
-            WHERE user_id=?
+            WHERE user_id=? AND status=?
+            ORDER BY completed_at DESC, id DESC
+            """,
+            (user_id, STATUS_PENDING),
+        ).fetchall()
+        done = conn.execute(
+            """
+            SELECT * FROM tasks
+            WHERE user_id=? AND status=?
             ORDER BY completed_at DESC, id DESC
             LIMIT ?
             """,
-            (user_id, limit),
+            (user_id, STATUS_DONE, limit),
         ).fetchall()
+        return pending + done
 
 
 def all_users():
@@ -440,6 +476,7 @@ def months_with_tasks() -> list[str]:
             """
             SELECT DISTINCT completed_month
             FROM tasks
+            WHERE status='done'
             ORDER BY substr(completed_month, 4, 4), substr(completed_month, 1, 2)
             """
         ).fetchall()
@@ -478,10 +515,11 @@ def mark_report_sent(user_id: int, month: str) -> None:
 
 
 def calc_kpi(rows) -> dict[str, Any]:
-    total = len(rows)
-    on_time = sum(1 for row in rows if row["on_time"] == 1)
-    late = sum(1 for row in rows if row["on_time"] == 0)
-    fault = sum(1 for row in rows if row["designer_fault_rework"] == 1)
+    done_rows = [row for row in rows if task_status(row) == STATUS_DONE]
+    total = len(done_rows)
+    on_time = sum(1 for row in done_rows if row["on_time"] == 1)
+    late = sum(1 for row in done_rows if row["on_time"] == 0)
+    fault = sum(1 for row in done_rows if row["designer_fault_rework"] == 1)
     on_time_pct = percent_value(on_time, total)
     late_pct = percent_value(late, total)
     fault_pct = percent_value(fault, total)
@@ -588,7 +626,23 @@ def latest_text(rows) -> str:
     if not rows:
         return "Пока нет сохраненных задач."
     lines = ["📋 <b>Последние задачи</b>"]
-    for row in rows:
+
+    pending_rows = [row for row in rows if task_status(row) == STATUS_PENDING]
+    done_rows = [row for row in rows if task_status(row) == STATUS_DONE]
+
+    if pending_rows:
+        lines.append("\n⏳ <b>В ожидании</b>")
+        for row in pending_rows:
+            lines.append(
+                "\n"
+                f"<b>#{row['id']} — {html.escape(row['title'])}</b>\n"
+                f"Добавлена: {fmt_dt(row['completed_at'])} МСК\n"
+                "Статус: ждет обратную связь"
+            )
+
+    if done_rows:
+        lines.append("\n✅ <b>Завершенные</b>")
+    for row in done_rows:
         lines.append(
             "\n"
             f"<b>#{row['id']} — {html.escape(row['title'])}</b>\n"
@@ -621,8 +675,33 @@ def parse_user_datetime(text: str) -> Optional[datetime]:
     return None
 
 
+def draft_status(draft: dict[str, Any]) -> str:
+    return draft.get("status") or STATUS_DONE
+
+
+def set_draft_pending(draft: dict[str, Any]) -> dict[str, Any]:
+    draft["status"] = STATUS_PENDING
+    draft["completed_at"] = draft.get("completed_at") or now_iso()
+    draft["on_time"] = draft.get("on_time", True)
+    draft["designer_fault_rework"] = draft.get("designer_fault_rework", False)
+    return draft
+
+
+def draft_required_fields(draft: dict[str, Any]) -> set[str]:
+    if draft_status(draft) == STATUS_PENDING:
+        return {"title", "status", "completed_at"}
+    return {"title", "on_time", "designer_fault_rework", "completed_at"}
+
+
 def draft_review_text(draft: dict[str, Any]) -> str:
     completed_at = parse_iso_msk(draft["completed_at"]) if isinstance(draft.get("completed_at"), str) else draft.get("completed_at")
+    if draft_status(draft) == STATUS_PENDING:
+        return (
+            "<b>Проверь запись</b>\n\n"
+            f"Задача: {html.escape(draft.get('title', '—'))}\n"
+            f"Добавлена: {fmt_dt(completed_at)} МСК\n"
+            "Статус: в ожидании обратной связи"
+        )
     return (
         "<b>Проверь запись</b>\n\n"
         f"Задача: {html.escape(draft.get('title', '—'))}\n"
@@ -707,6 +786,18 @@ def date_choice_keyboard(prefix: str) -> InlineKeyboardMarkup:
     )
 
 
+def status_choice_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Да", callback_data=f"{prefix}:1"),
+                InlineKeyboardButton("❌ Нет", callback_data=f"{prefix}:0"),
+            ],
+            [InlineKeyboardButton("⏳ На рассмотрении", callback_data=f"{prefix}:pending")],
+        ]
+    )
+
+
 def download_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -737,10 +828,22 @@ def sheet_xml(rows: list[list[Any]]) -> str:
             ref = f"{col_letter(col_idx)}{row_idx}"
             cells.append(f'<c r="{ref}" t="inlineStr"><is><t>{xml_text(value)}</t></is></c>')
         row_xml.append(f'<row r="{row_idx}">{"".join(cells)}</row>')
+
+    max_cols = max((len(row) for row in rows), default=0)
+    col_xml = []
+    for col_idx in range(1, max_cols + 1):
+        max_len = max(
+            (len(str(row[col_idx - 1])) for row in rows if len(row) >= col_idx and row[col_idx - 1] is not None),
+            default=8,
+        )
+        width = min(max(max_len + 3, 10), 70)
+        col_xml.append(f'<col min="{col_idx}" max="{col_idx}" width="{width}" customWidth="1"/>')
+    cols_xml = f'<cols>{"".join(col_xml)}</cols>' if col_xml else ""
+
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f'<sheetData>{"".join(row_xml)}</sheetData>'
+        f'{cols_xml}<sheetData>{"".join(row_xml)}</sheetData>'
         "</worksheet>"
     )
 
@@ -889,6 +992,7 @@ def draft_from_row(row) -> dict[str, Any]:
     return {
         "title": row["title"],
         "completed_at": row["completed_at"],
+        "status": task_status(row),
         "on_time": row["on_time"] == 1,
         "designer_fault_rework": row["designer_fault_rework"] == 1,
     }
@@ -900,6 +1004,7 @@ def apply_draft_to_task(user_id: int, task_id: int, draft: dict[str, Any]) -> Op
         task_id,
         title=draft["title"],
         completed_at=parse_iso_msk(draft["completed_at"]),
+        status=draft.get("status", STATUS_DONE),
         on_time=bool(draft["on_time"]),
         designer_fault_rework=bool(draft["designer_fault_rework"]),
     )
@@ -1046,7 +1151,7 @@ async def process_add_title(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     context.user_data["state"] = None
     await update.message.reply_text(
         "Выполнена в срок?",
-        reply_markup=bool_keyboard("add_on_time"),
+        reply_markup=status_choice_keyboard("add_on_time"),
     )
 
 
@@ -1058,7 +1163,7 @@ async def process_update_title(update: Update, context: ContextTypes.DEFAULT_TYP
     draft["title"] = text.strip()
     context.user_data["draft"] = draft
     context.user_data["state"] = None
-    await update.message.reply_text("Выполнена в срок?", reply_markup=bool_keyboard("update_on_time"))
+    await update.message.reply_text("Выполнена в срок?", reply_markup=status_choice_keyboard("update_on_time"))
 
 
 async def process_add_date(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1242,6 +1347,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("add_on_time:"):
         draft = context.user_data.get("draft", {})
+        if data.endswith(":pending"):
+            draft = set_draft_pending(draft)
+            context.user_data["draft"] = draft
+            await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=review_keyboard())
+            return
+        draft["status"] = STATUS_DONE
         draft["on_time"] = data.endswith(":1")
         context.user_data["draft"] = draft
         await query.edit_message_text(
@@ -1259,6 +1370,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("update_on_time:"):
         draft = context.user_data.get("draft", {})
+        if data.endswith(":pending"):
+            draft = set_draft_pending(draft)
+            context.user_data["draft"] = draft
+            await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=update_review_keyboard())
+            return
+        draft["status"] = STATUS_DONE
         draft["on_time"] = data.endswith(":1")
         context.user_data["draft"] = draft
         await query.edit_message_text(
@@ -1314,20 +1431,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "draft:save":
         draft = context.user_data.get("draft", {})
-        required = {"title", "on_time", "designer_fault_rework", "completed_at"}
+        required = draft_required_fields(draft)
         if not required.issubset(draft):
             await query.edit_message_text("Не все поля заполнены. Начните добавление заново.", reply_markup=None)
             context.user_data.clear()
             return
         completed_at = parse_iso_msk(draft["completed_at"])
-        insert_task(
+        task_id = insert_task(
             user_id,
             draft["title"],
             completed_at,
-            bool(draft["on_time"]),
-            bool(draft["designer_fault_rework"]),
+            bool(draft.get("on_time", True)),
+            bool(draft.get("designer_fault_rework", False)),
+            draft_status(draft),
         )
         context.user_data.clear()
+        if draft_status(draft) == STATUS_PENDING:
+            await query.edit_message_text(
+                (
+                    f"⏳ <b>Задача #{task_id} добавлена в ожидание.</b>\n\n"
+                    "Она появится в «Последних задачах» в отдельной категории и пока не участвует в KPI. "
+                    "Когда будет обратная связь, открой «Исправить / удалить» и заверши запись."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            return
         month = month_key(completed_at)
         rows = tasks_for_month(user_id, month)
         await query.edit_message_text(saved_caption(month, rows), parse_mode=ParseMode.HTML)
@@ -1341,7 +1469,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "update:save":
         task_id = context.user_data.get("edit_task_id")
         draft = context.user_data.get("draft", {})
-        required = {"title", "on_time", "designer_fault_rework", "completed_at"}
+        required = draft_required_fields(draft)
         if not task_id or not required.issubset(draft):
             context.user_data.clear()
             await query.edit_message_text("Не все поля заполнены. Начните обновление заново.")
@@ -1350,6 +1478,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         context.user_data.clear()
         if not month:
             await query.edit_message_text("Запись уже не найдена.")
+            return
+        if draft_status(draft) == STATUS_PENDING:
+            await query.edit_message_text(
+                (
+                    f"⏳ <b>Запись #{int(task_id)} обновлена и оставлена в ожидании.</b>\n\n"
+                    "В KPI она пока не участвует. Когда появится обратная связь, можно снова открыть запись и закрыть её."
+                ),
+                parse_mode=ParseMode.HTML,
+            )
             return
         rows = tasks_for_month(user_id, month)
         await query.edit_message_text(
@@ -1383,7 +1520,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     if data == "draft_edit:on_time":
-        await query.edit_message_text("Выполнена в срок?", reply_markup=bool_keyboard("draft_set_on_time"))
+        await query.edit_message_text("Выполнена в срок?", reply_markup=status_choice_keyboard("draft_set_on_time"))
         return
 
     if data == "draft_edit:fault":
@@ -1406,6 +1543,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data.startswith("draft_set_on_time:"):
         draft = context.user_data.get("draft", {})
+        if data.endswith(":pending"):
+            draft = set_draft_pending(draft)
+            context.user_data["draft"] = draft
+            await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=current_review_keyboard(context))
+            return
+        draft["status"] = STATUS_DONE
         draft["on_time"] = data.endswith(":1")
         context.user_data["draft"] = draft
         await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=current_review_keyboard(context))
