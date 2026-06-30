@@ -251,6 +251,23 @@ def previous_month() -> str:
     return month_key(first_day - timedelta(days=1))
 
 
+def parse_report_month(value: str) -> Optional[str]:
+    cleaned = value.strip().replace("/", ".").replace("-", ".")
+    parts = cleaned.split(".")
+    if len(parts) != 2:
+        return None
+
+    try:
+        month = int(parts[0])
+        year = int(parts[1])
+    except ValueError:
+        return None
+
+    if not 1 <= month <= 12 or year < 2000:
+        return None
+    return f"{month:02d}.{year}"
+
+
 def month_label(month: str) -> str:
     month_num, year = month.split(".")
     return f"{MONTHS_RU[int(month_num)]} {year}"
@@ -693,6 +710,19 @@ def latest_text(rows) -> str:
     return "\n".join(lines)
 
 
+def latest_tasks_keyboard(rows) -> Optional[InlineKeyboardMarkup]:
+    pending_rows = [row for row in rows if task_status(row) == STATUS_PENDING]
+    if not pending_rows:
+        return None
+
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(f"✅ Завершить #{row['id']}", callback_data=f"pending_close:{row['id']}")]
+            for row in pending_rows
+        ]
+    )
+
+
 def parse_user_datetime(text: str) -> Optional[datetime]:
     value = " ".join(text.strip().split())
     if not value:
@@ -843,6 +873,7 @@ def download_keyboard() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("Текущий месяц", callback_data="download:current")],
             [InlineKeyboardButton("Предыдущий месяц", callback_data="download:previous")],
+            [InlineKeyboardButton("Другой месяц", callback_data="download:month")],
             [InlineKeyboardButton("За все время", callback_data="download:all")],
         ]
     )
@@ -1052,6 +1083,16 @@ def apply_draft_to_task(user_id: int, task_id: int, draft: dict[str, Any]) -> Op
     )
 
 
+def close_pending_task_result(user_id: int, task_id: int, draft: dict[str, Any]) -> tuple[bool, str]:
+    draft["status"] = STATUS_DONE
+    month = apply_draft_to_task(user_id, task_id, draft)
+    if not month:
+        return False, "Запись уже не найдена."
+
+    rows = tasks_for_month(user_id, month)
+    return True, updated_caption(task_id, month, rows)
+
+
 async def start_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     context.user_data["state"] = "add_title"
@@ -1085,7 +1126,10 @@ async def start_full_edit(update: Update, context: ContextTypes.DEFAULT_TYPE, ta
 
 async def start_download(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
-    await update.message.reply_text("Какую таблицу скачать?", reply_markup=download_keyboard())
+    await update.message.reply_text(
+        "Какую таблицу скачать?\n\nДля конкретного месяца можно также написать /download 06.2026",
+        reply_markup=download_keyboard(),
+    )
 
 
 async def show_current_kpi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1098,7 +1142,11 @@ async def show_current_kpi(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def show_latest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     rows = latest_tasks(update.effective_user.id)
-    await update.message.reply_text(latest_text(rows), parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+    await update.message.reply_text(
+        latest_text(rows),
+        parse_mode=ParseMode.HTML,
+        reply_markup=latest_tasks_keyboard(rows) or MAIN_MENU,
+    )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1121,7 +1169,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/latest — последние задачи\n"
         "/edit — исправить или удалить запись\n"
         "/edit ID — полностью обновить запись по номеру\n"
-        "/download — скачать таблицу",
+        "/download — скачать таблицу\n"
+        "/download 06.2026 — скачать таблицу за месяц",
         parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
     )
@@ -1167,6 +1216,14 @@ async def sliv_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def download_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_user(update)
+    if context.args:
+        month = parse_report_month(" ".join(context.args))
+        if not month:
+            await update.message.reply_text("Напишите месяц в формате 06.2026.", reply_markup=MAIN_MENU)
+            return
+        rows = tasks_for_month(update.effective_user.id, month)
+        await send_report_file(context.bot, update.effective_chat.id, update.effective_user.id, month, kpi_text(month, rows))
+        return
     await start_download(update, context)
 
 
@@ -1230,6 +1287,36 @@ async def process_update_date(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data["draft"] = draft
     context.user_data["state"] = None
     await update.message.reply_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=update_review_keyboard())
+
+
+async def process_pending_date(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    dt = parse_user_datetime(text)
+    if not dt:
+        await update.message.reply_text("Не понял дату. Напишите так: 20.06.2026 18:45")
+        return
+
+    task_id = context.user_data.get("edit_task_id")
+    draft = context.user_data.get("draft", {})
+    if not task_id or not draft:
+        context.user_data.clear()
+        await update.message.reply_text("Не нашел задачу в ожидании. Откройте «Последние задачи» и попробуйте снова.", reply_markup=MAIN_MENU)
+        return
+
+    draft["completed_at"] = dt.isoformat(timespec="seconds")
+    ok, message = close_pending_task_result(update.effective_user.id, int(task_id), draft)
+    context.user_data.clear()
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
+
+
+async def process_download_month(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    month = parse_report_month(text)
+    if not month:
+        await update.message.reply_text("Напишите месяц в формате 06.2026.")
+        return
+
+    context.user_data.clear()
+    rows = tasks_for_month(update.effective_user.id, month)
+    await send_report_file(context.bot, update.effective_chat.id, update.effective_user.id, month, kpi_text(month, rows))
 
 
 async def process_draft_title(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1308,6 +1395,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if state == "update_date":
         await process_update_date(update, context, text)
         return
+    if state == "pending_date":
+        await process_pending_date(update, context, text)
+        return
+    if state == "download_month":
+        await process_download_month(update, context, text)
+        return
     if state == "draft_title":
         await process_draft_title(update, context, text)
         return
@@ -1358,6 +1451,69 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "manage:cancel":
         context.user_data.clear()
         await query.edit_message_text("Хорошо, ничего не меняем.")
+        return
+
+    if data.startswith("pending_close:"):
+        task_id = int(data.rsplit(":", 1)[1])
+        row = task_by_id(user_id, task_id)
+        if not row or task_status(row) != STATUS_PENDING:
+            context.user_data.clear()
+            await query.edit_message_text("Задача уже не в ожидании.")
+            return
+
+        draft = draft_from_row(row)
+        draft["status"] = STATUS_DONE
+        context.user_data.clear()
+        context.user_data["mode"] = "close_pending"
+        context.user_data["edit_task_id"] = task_id
+        context.user_data["draft"] = draft
+        await query.edit_message_text(
+            f"Закрываем задачу #{task_id}.\n\nВыполнена в срок?",
+            reply_markup=bool_keyboard("pending_on_time"),
+        )
+        return
+
+    if data.startswith("pending_on_time:"):
+        draft = context.user_data.get("draft", {})
+        draft["status"] = STATUS_DONE
+        draft["on_time"] = data.endswith(":1")
+        context.user_data["draft"] = draft
+        await query.edit_message_text(
+            "Были правки по моей вине?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton("✅ Нет", callback_data="pending_fault:0"),
+                        InlineKeyboardButton("❌ Да", callback_data="pending_fault:1"),
+                    ]
+                ]
+            ),
+        )
+        return
+
+    if data.startswith("pending_fault:"):
+        draft = context.user_data.get("draft", {})
+        draft["designer_fault_rework"] = data.endswith(":1")
+        context.user_data["draft"] = draft
+        await query.edit_message_text("Когда задача была выполнена?", reply_markup=date_choice_keyboard("pending_date"))
+        return
+
+    if data == "pending_date:now":
+        task_id = context.user_data.get("edit_task_id")
+        draft = context.user_data.get("draft", {})
+        if not task_id or not draft:
+            context.user_data.clear()
+            await query.edit_message_text("Не нашел задачу в ожидании. Открой «Последние задачи» и попробуй снова.")
+            return
+        draft["completed_at"] = now_iso()
+        ok, message = close_pending_task_result(user_id, int(task_id), draft)
+        context.user_data.clear()
+        await query.edit_message_text(message, parse_mode=ParseMode.HTML)
+        return
+
+    if data == "pending_date:custom":
+        context.user_data["state"] = "pending_date"
+        await query.edit_message_text("Напишите дату и время выполнения по МСК.\nНапример: 20.06.2026 18:45")
         return
 
     if data.startswith("delete:confirm:"):
@@ -1602,6 +1758,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             month = previous_month()
             rows = tasks_for_month(user_id, month)
             await send_report_file(context.bot, chat_id, user_id, month, kpi_text(month, rows))
+        elif mode == "month":
+            context.user_data.clear()
+            context.user_data["state"] = "download_month"
+            await query.edit_message_text("Напишите месяц в формате 06.2026.")
         else:
             rows = all_tasks(user_id)
             await send_report_file(context.bot, chat_id, user_id, None, "📥 Таблица за все время.", all_time=True)
