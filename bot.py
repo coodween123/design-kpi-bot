@@ -615,6 +615,37 @@ def updated_caption(task_id: int, month: str, rows) -> str:
     return f"✅ <b>Запись #{task_id} обновлена и внесена в таблицу.</b>\n\n{month_progress_text(month, rows)}{premium_warning_text(rows)}"
 
 
+def save_new_task_result(user_id: int, draft: dict[str, Any]) -> tuple[bool, str]:
+    required = draft_required_fields(draft)
+    if not required.issubset(draft):
+        return False, "Не все поля заполнены. Начните добавление заново."
+
+    completed_at = parse_iso_msk(draft["completed_at"])
+    status = draft_status(draft)
+    task_id = insert_task(
+        user_id,
+        draft["title"],
+        completed_at,
+        bool(draft.get("on_time", True)),
+        bool(draft.get("designer_fault_rework", False)),
+        status,
+    )
+
+    if status == STATUS_PENDING:
+        return (
+            True,
+            (
+                f"⏳ <b>Задача #{task_id} добавлена в ожидание.</b>\n\n"
+                "Она появится в «Последних задачах» в отдельной категории и пока не участвует в KPI. "
+                "Когда будет обратная связь, открой «Исправить / удалить» и заверши запись."
+            ),
+        )
+
+    month = month_key(completed_at)
+    rows = tasks_for_month(user_id, month)
+    return True, saved_caption(month, rows)
+
+
 def monthly_caption(month: str, rows) -> str:
     stats = calc_kpi(rows)
     return (
@@ -1184,9 +1215,9 @@ async def process_add_date(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return
     draft = context.user_data.get("draft", {})
     draft["completed_at"] = dt.isoformat(timespec="seconds")
-    context.user_data["draft"] = draft
-    context.user_data["state"] = None
-    await update.message.reply_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=current_review_keyboard(context))
+    ok, message = save_new_task_result(update.effective_user.id, draft)
+    context.user_data.clear()
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML, reply_markup=MAIN_MENU)
 
 
 async def process_update_date(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
@@ -1360,8 +1391,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         draft = context.user_data.get("draft", {})
         if data.endswith(":pending"):
             draft = set_draft_pending(draft)
-            context.user_data["draft"] = draft
-            await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=review_keyboard())
+            ok, message = save_new_task_result(user_id, draft)
+            context.user_data.clear()
+            await query.edit_message_text(message, parse_mode=ParseMode.HTML)
             return
         draft["status"] = STATUS_DONE
         draft["on_time"] = data.endswith(":1")
@@ -1419,8 +1451,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if data == "add_date:now":
         draft = context.user_data.get("draft", {})
         draft["completed_at"] = now_iso()
-        context.user_data["draft"] = draft
-        await query.edit_message_text(draft_review_text(draft), parse_mode=ParseMode.HTML, reply_markup=review_keyboard())
+        ok, message = save_new_task_result(user_id, draft)
+        context.user_data.clear()
+        await query.edit_message_text(message, parse_mode=ParseMode.HTML)
         return
 
     if data == "add_date:custom":
@@ -1442,34 +1475,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if data == "draft:save":
         draft = context.user_data.get("draft", {})
-        required = draft_required_fields(draft)
-        if not required.issubset(draft):
-            await query.edit_message_text("Не все поля заполнены. Начните добавление заново.", reply_markup=None)
-            context.user_data.clear()
-            return
-        completed_at = parse_iso_msk(draft["completed_at"])
-        task_id = insert_task(
-            user_id,
-            draft["title"],
-            completed_at,
-            bool(draft.get("on_time", True)),
-            bool(draft.get("designer_fault_rework", False)),
-            draft_status(draft),
-        )
+        ok, message = save_new_task_result(user_id, draft)
         context.user_data.clear()
-        if draft_status(draft) == STATUS_PENDING:
-            await query.edit_message_text(
-                (
-                    f"⏳ <b>Задача #{task_id} добавлена в ожидание.</b>\n\n"
-                    "Она появится в «Последних задачах» в отдельной категории и пока не участвует в KPI. "
-                    "Когда будет обратная связь, открой «Исправить / удалить» и заверши запись."
-                ),
-                parse_mode=ParseMode.HTML,
-            )
-            return
-        month = month_key(completed_at)
-        rows = tasks_for_month(user_id, month)
-        await query.edit_message_text(saved_caption(month, rows), parse_mode=ParseMode.HTML)
+        await query.edit_message_text(message, parse_mode=ParseMode.HTML)
         return
 
     if data == "draft:cancel":
