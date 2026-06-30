@@ -40,6 +40,7 @@ DATETIME_FMT = "%d.%m.%Y %H:%M"
 
 KPI_DEADLINE_MAX = 10_000
 KPI_QUALITY_MAX = 5_000
+BASE_SALARY = 50_000
 STATUS_DONE = "done"
 STATUS_PENDING = "pending"
 
@@ -548,6 +549,8 @@ def calc_kpi(rows) -> dict[str, Any]:
         "deadline_kpi": deadline_kpi,
         "quality_kpi": quality_kpi,
         "total_kpi": deadline_kpi + quality_kpi,
+        "base_salary": BASE_SALARY,
+        "total_with_salary": BASE_SALARY + deadline_kpi + quality_kpi,
     }
 
 
@@ -560,7 +563,9 @@ def kpi_text(month: str, rows) -> str:
         f"KPI за сроки: <b>{money(stats['deadline_kpi'])}</b>\n\n"
         f"С правками по твоей вине: <b>{stats['fault']} из {stats['total']} — {percent_text(stats['fault_pct'])}</b>\n"
         f"KPI за качество: <b>{money(stats['quality_kpi'])}</b>\n\n"
-        f"<b>Итоговая выплата: {money(stats['total_kpi'])}</b>"
+        f"KPI всего: <b>{money(stats['total_kpi'])}</b>\n"
+        f"Оклад: <b>{money(stats['base_salary'])}</b>\n"
+        f"<b>Итого с учетом оклада: {money(stats['total_with_salary'])}</b>"
     )
 
 
@@ -569,7 +574,9 @@ def month_progress_text(month: str, rows) -> str:
     return (
         f"Всего задач за {html.escape(month_label(month))}: <b>{stats['total']}</b>\n"
         f"Выполнено в срок: <b>{stats['on_time']} — {percent_text(stats['on_time_pct'])}</b>\n"
-        f"С правками по твоей вине: <b>{stats['fault']} — {percent_text(stats['fault_pct'])}</b>\n\n"
+        f"С правками по твоей вине: <b>{stats['fault']} — {percent_text(stats['fault_pct'])}</b>\n"
+        f"KPI за месяц: <b>{money(stats['total_kpi'])}</b>\n"
+        f"Итого с окладом: <b>{money(stats['total_with_salary'])}</b>\n\n"
         f"Excel можно скачать кнопкой «📥 Скачать таблицу»."
     )
 
@@ -617,7 +624,9 @@ def monthly_caption(month: str, rows) -> str:
         f"KPI за сроки: <b>{money(stats['deadline_kpi'])}</b>\n\n"
         f"С правками по твоей вине: <b>{stats['fault']} из {stats['total']} — {percent_text(stats['fault_pct'])}</b>\n"
         f"KPI за качество: <b>{money(stats['quality_kpi'])}</b>\n\n"
-        f"<b>Итоговая выплата: {money(stats['total_kpi'])}</b>\n\n"
+        f"KPI всего: <b>{money(stats['total_kpi'])}</b>\n"
+        f"Оклад: <b>{money(stats['base_salary'])}</b>\n"
+        f"<b>Итого с учетом оклада: {money(stats['total_with_salary'])}</b>\n\n"
         f"Итоговая таблица прикреплена ниже."
     )
 
@@ -907,7 +916,9 @@ def report_workbook(
         ["Выполнено в срок", stats["on_time"], percent_text(stats["on_time_pct"]), money(stats["deadline_kpi"])],
         ["Выполнено не в срок", stats["late"], percent_text(stats["late_pct"]), "—"],
         ["С правками по моей вине", stats["fault"], percent_text(stats["fault_pct"]), money(stats["quality_kpi"])],
-        ["Итоговая выплата", "—", "—", money(stats["total_kpi"])],
+        ["KPI всего", "—", "—", money(stats["total_kpi"])],
+        ["Оклад", "—", "—", money(stats["base_salary"])],
+        ["Итого с учетом оклада", "—", "—", money(stats["total_with_salary"])],
     ]
     summary_rows.extend(
         [
