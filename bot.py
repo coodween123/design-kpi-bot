@@ -2,6 +2,7 @@ import html
 import io
 import logging
 import os
+import re
 import sqlite3
 import zipfile
 from datetime import date, datetime, time as dt_time, timedelta
@@ -45,6 +46,7 @@ STATUS_DONE = "done"
 STATUS_PENDING = "pending"
 
 BTN_ADD = "➕ Добавить задачу"
+BTN_BULK_ADD = "⚡ Быстрый ввод задач"
 BTN_KPI = "📊 KPI текущего месяца"
 BTN_LATEST = "📋 Последние задачи"
 BTN_EDIT = "✏️ Исправить / удалить"
@@ -53,14 +55,14 @@ BTN_DOWNLOAD = "📥 Скачать таблицу"
 
 MAIN_MENU = ReplyKeyboardMarkup(
     [
-        [BTN_ADD],
+        [BTN_ADD, BTN_BULK_ADD],
         [BTN_KPI, BTN_LATEST],
         [BTN_EDIT, BTN_DOWNLOAD],
     ],
     resize_keyboard=True,
 )
 
-MAIN_MENU_TEXTS = {BTN_ADD, BTN_KPI, BTN_LATEST, BTN_EDIT, BTN_EDIT_LEGACY, BTN_DOWNLOAD}
+MAIN_MENU_TEXTS = {BTN_ADD, BTN_BULK_ADD, BTN_KPI, BTN_LATEST, BTN_EDIT, BTN_EDIT_LEGACY, BTN_DOWNLOAD}
 
 MONTHS_RU = {
     1: "январь",
@@ -723,6 +725,138 @@ def latest_tasks_keyboard(rows) -> Optional[InlineKeyboardMarkup]:
     )
 
 
+BULK_FIELD_ALIASES = {
+    "title": ("название", "задача", "название задачи", "task", "title"),
+    "on_time": ("в срок", "выполнена в срок", "срок", "on time"),
+    "fault": ("правки", "были правки", "правки по моей вине", "по моей вине", "rework"),
+    "completed_at": ("время", "дата", "дата выполнения", "время выполнения", "выполнена", "completed at"),
+}
+
+
+def normalize_bulk_bool(value: str) -> Optional[bool]:
+    cleaned = re.sub(r"[^a-zа-яё0-9]+", " ", value.lower()).strip()
+    yes_values = {"да", "yes", "y", "1", "true", "верно", "в срок"}
+    no_values = {"нет", "no", "n", "0", "false", "не было"}
+    if cleaned in yes_values:
+        return True
+    if cleaned in no_values:
+        return False
+    return None
+
+
+def strip_bulk_prefix(line: str) -> str:
+    value = line.strip()
+    value = re.sub(r"^\s*(?:[-•*]|\d+\s*[.)-])\s*", "", value)
+    return value.strip()
+
+
+def detect_bulk_field(line: str) -> tuple[Optional[str], str]:
+    value = strip_bulk_prefix(line)
+    if not value:
+        return None, ""
+
+    if ":" in value:
+        label, content = value.split(":", 1)
+        normalized_label = re.sub(r"\s+", " ", label.lower()).strip()
+        for field, aliases in BULK_FIELD_ALIASES.items():
+            if normalized_label in aliases or any(alias in normalized_label for alias in aliases):
+                return field, content.strip()
+
+    return None, value
+
+
+def parse_bulk_task_block(lines: list[str], block_number: int) -> tuple[Optional[dict[str, Any]], list[str]]:
+    values: dict[str, str] = {}
+    positional: list[str] = []
+
+    for raw_line in lines:
+        field, value = detect_bulk_field(raw_line)
+        if not value:
+            continue
+        if field:
+            values[field] = value
+        else:
+            positional.append(value)
+
+    ordered_fields = ["title", "on_time", "fault", "completed_at"]
+    for field, value in zip((f for f in ordered_fields if f not in values), positional):
+        values[field] = value
+
+    errors: list[str] = []
+    title = values.get("title", "").strip()
+    if len(title) < 2:
+        errors.append(f"Блок {block_number}: не найдено название задачи")
+
+    on_time = normalize_bulk_bool(values.get("on_time", ""))
+    if on_time is None:
+        errors.append(f"Блок {block_number}: поле «в срок» должно быть да/нет")
+
+    fault = normalize_bulk_bool(values.get("fault", ""))
+    if fault is None:
+        errors.append(f"Блок {block_number}: поле «правки» должно быть да/нет")
+
+    completed_at = parse_user_datetime(values.get("completed_at", ""))
+    if not completed_at:
+        errors.append(f"Блок {block_number}: дата должна быть в формате 17.07.2026 16:00")
+
+    if errors:
+        return None, errors
+
+    return {
+        "title": title,
+        "on_time": bool(on_time),
+        "designer_fault_rework": bool(fault),
+        "completed_at": completed_at,
+    }, []
+
+
+def split_bulk_blocks(text: str) -> list[list[str]]:
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalized:
+        return []
+
+    blank_blocks = [
+        [line for line in block.split("\n") if line.strip()]
+        for block in re.split(r"\n\s*\n+", normalized)
+        if block.strip()
+    ]
+
+    if len(blank_blocks) > 1:
+        return blank_blocks
+
+    lines = [line for line in normalized.split("\n") if line.strip()]
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if current and re.match(r"^\s*1\s*[.)-]", stripped):
+            blocks.append(current)
+            current = []
+        current.append(line)
+    if current:
+        blocks.append(current)
+
+    if len(blocks) == 1 and len(lines) >= 8 and len(lines) % 4 == 0:
+        blocks = [lines[i:i + 4] for i in range(0, len(lines), 4)]
+
+    return blocks
+
+
+def parse_bulk_tasks(text: str) -> tuple[list[dict[str, Any]], list[str]]:
+    blocks = split_bulk_blocks(text)
+    if not blocks:
+        return [], ["Сообщение пустое"]
+
+    tasks: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for index, block in enumerate(blocks, start=1):
+        task, block_errors = parse_bulk_task_block(block, index)
+        if task:
+            tasks.append(task)
+        errors.extend(block_errors)
+    return tasks, errors
+
+
 def parse_user_datetime(text: str) -> Optional[datetime]:
     value = " ".join(text.strip().split())
     if not value:
@@ -1100,6 +1234,65 @@ async def start_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Введите название выполненной задачи.", reply_markup=MAIN_MENU)
 
 
+async def start_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.clear()
+    context.user_data["state"] = "bulk_add"
+    await update.message.reply_text(
+        "Отправьте одним сообщением сразу несколько выполненных задач.\n\n"
+        "Каждая задача — отдельный блок из четырех строк. Подписи можно писать или не писать.\n\n"
+        "Пример:\n"
+        "1. презентация\n"
+        "2. да\n"
+        "3. нет\n"
+        "4. 17.07.2026 16:00\n\n"
+        "1. презентация 2\n"
+        "2. да\n"
+        "3. нет\n"
+        "4. 17.07.2026 17:00\n\n"
+        "Также можно писать: «Название: ...», «В срок: да», «Правки: нет», «Время: ...».",
+        reply_markup=MAIN_MENU,
+    )
+
+
+async def process_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    tasks, errors = parse_bulk_tasks(text)
+    if errors:
+        error_text = "\n".join(f"• {html.escape(error)}" for error in errors[:10])
+        await update.message.reply_text(
+            "Не удалось распознать все задачи:\n\n" + error_text +
+            "\n\nИсправьте сообщение и отправьте его ещё раз. Уже распознанные задачи пока не сохранены.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    task_ids: list[int] = []
+    affected_months: set[str] = set()
+    for task in tasks:
+        task_id = insert_task(
+            update.effective_user.id,
+            task["title"],
+            task["completed_at"],
+            task["on_time"],
+            task["designer_fault_rework"],
+            STATUS_DONE,
+        )
+        task_ids.append(task_id)
+        affected_months.add(month_key(task["completed_at"]))
+
+    context.user_data.clear()
+    ids_text = ", ".join(f"#{task_id}" for task_id in task_ids)
+    lines = [f"✅ <b>Добавлено задач: {len(task_ids)}</b>", f"Записи: {ids_text}"]
+    for month in sorted(affected_months):
+        rows = tasks_for_month(update.effective_user.id, month)
+        lines.append("\n" + month_progress_text(month, rows))
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=MAIN_MENU,
+    )
+
+
 async def start_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
     await update.message.reply_text(
@@ -1164,7 +1357,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "<b>Команды</b>\n\n"
         "/start — открыть меню\n"
-        "/add — добавить задачу\n"
+        "/add — добавить задачу\n/bulk — быстрый ввод нескольких задач\n"
         "/kpi — KPI текущего месяца\n"
         "/latest — последние задачи\n"
         "/edit — исправить или удалить запись\n"
@@ -1179,6 +1372,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def add_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     upsert_user(update)
     await start_add(update, context)
+
+
+async def bulk_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    upsert_user(update)
+    await start_bulk_add(update, context)
 
 
 async def kpi_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1233,6 +1431,7 @@ async def setup_commands(app: Application) -> None:
         [
             BotCommand("start", "открыть меню"),
             BotCommand("add", "добавить выполненную задачу"),
+            BotCommand("bulk", "быстро добавить несколько задач"),
             BotCommand("kpi", "KPI текущего месяца"),
             BotCommand("latest", "последние задачи"),
             BotCommand("edit", "исправить или удалить запись"),
@@ -1368,6 +1567,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if text in MAIN_MENU_TEXTS:
         if text == BTN_ADD:
             await start_add(update, context)
+        elif text == BTN_BULK_ADD:
+            await start_bulk_add(update, context)
         elif text == BTN_KPI:
             context.user_data.clear()
             await show_current_kpi(update, context)
@@ -1383,6 +1584,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     state = context.user_data.get("state")
 
+    if state == "bulk_add":
+        await process_bulk_add(update, context, text)
+        return
     if state == "add_title":
         await process_add_title(update, context, text)
         return
@@ -1800,6 +2004,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
+    app.add_handler(CommandHandler("bulk", bulk_cmd))
     app.add_handler(CommandHandler("kpi", kpi_cmd))
     app.add_handler(CommandHandler("latest", latest_cmd))
     app.add_handler(CommandHandler("edit", edit_cmd))
