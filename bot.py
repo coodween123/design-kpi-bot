@@ -1,3 +1,4 @@
+import calendar
 import html
 import io
 import logging
@@ -573,11 +574,58 @@ def calc_kpi(rows) -> dict[str, Any]:
     }
 
 
+def task_activity_stats(month: str, rows) -> dict[str, Any]:
+    day_counts: dict[date, int] = {}
+    for row in rows:
+        if task_status(row) != STATUS_DONE:
+            continue
+        completed_day = parse_iso_msk(row["completed_at"]).date()
+        day_counts[completed_day] = day_counts.get(completed_day, 0) + 1
+
+    month_num, year = map(int, month.split("."))
+    days_in_month = calendar.monthrange(year, month_num)[1]
+    today = now_msk().date()
+
+    if year == today.year and month_num == today.month:
+        counted_days = today.day
+    else:
+        counted_days = days_in_month
+
+    total_tasks = sum(day_counts.values())
+    average_per_day = total_tasks / counted_days if counted_days else 0.0
+
+    if day_counts:
+        max_tasks = max(day_counts.values())
+        active_days = sorted(day for day, count in day_counts.items() if count == max_tasks)
+    else:
+        max_tasks = 0
+        active_days = []
+
+    return {
+        "active_days": active_days,
+        "max_tasks": max_tasks,
+        "average_per_day": average_per_day,
+        "counted_days": counted_days,
+    }
+
+
 def kpi_text(month: str, rows) -> str:
     stats = calc_kpi(rows)
+    activity = task_activity_stats(month, rows)
+
+    if activity["active_days"]:
+        active_dates = ", ".join(day.strftime(DATE_FMT) for day in activity["active_days"])
+        active_day_text = f"{active_dates} — {activity['max_tasks']} {task_word(activity['max_tasks'])}"
+    else:
+        active_day_text = "пока нет задач"
+
+    average_text = f"{activity['average_per_day']:.2f}".replace(".", ",")
+
     return (
         f"📊 <b>KPI за {html.escape(month_label(month))}</b>\n\n"
-        f"Всего задач: <b>{stats['total']}</b>\n\n"
+        f"Всего задач: <b>{stats['total']}</b>\n"
+        f"Самый активный день: <b>{active_day_text}</b>\n"
+        f"Среднее количество задач в день: <b>{average_text}</b>\n\n"
         f"В срок: <b>{stats['on_time']} из {stats['total']} — {percent_text(stats['on_time_pct'])}</b>\n"
         f"KPI за сроки: <b>{money(stats['deadline_kpi'])}</b>\n\n"
         f"С правками по твоей вине: <b>{stats['fault']} из {stats['total']} — {percent_text(stats['fault_pct'])}</b>\n"
@@ -1238,9 +1286,14 @@ async def start_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     context.user_data.clear()
     context.user_data["state"] = "bulk_add"
     await update.message.reply_text(
-        "Отправьте одним сообщением сразу несколько выполненных задач.\n\n"
-        "Каждая задача — отдельный блок из четырех строк. Подписи можно писать или не писать.\n\n"
-        "Пример:\n"
+        "⚡ <b>Быстрый ввод задач</b>\n\n"
+        "За одно сообщение можно добавить сразу несколько выполненных задач.\n\n"
+        "<b>Что означает каждая строка:</b>\n"
+        "1. Название задачи\n"
+        "2. Выполнена в срок — напишите да или нет\n"
+        "3. Были правки по моей вине — напишите да или нет\n"
+        "4. Дата и время выполнения — формат дд.мм.гггг чч:мм\n\n"
+        "<b>Пример:</b>\n"
         "1. презентация\n"
         "2. да\n"
         "3. нет\n"
@@ -1249,7 +1302,13 @@ async def start_bulk_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "2. да\n"
         "3. нет\n"
         "4. 17.07.2026 17:00\n\n"
-        "Также можно писать: «Название: ...», «В срок: да», «Правки: нет», «Время: ...».",
+        "Каждую новую задачу отделяйте пустой строкой.\n\n"
+        "Также можно писать с подписями:\n"
+        "Название задачи: презентация\n"
+        "Выполнена в срок: да\n"
+        "Были правки по моей вине: нет\n"
+        "Дата выполнения: 17.07.2026 16:00",
+        parse_mode=ParseMode.HTML,
         reply_markup=MAIN_MENU,
     )
 
