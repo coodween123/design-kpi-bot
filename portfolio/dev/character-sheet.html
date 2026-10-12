@@ -1,0 +1,21 @@
+<!doctype html><meta charset="utf-8"><title>Лист персонажа</title>
+<style>body{margin:0;background:#1d5a8f}.row{display:flex;gap:6px;padding:6px;flex-wrap:wrap}canvas{background:#e9f4f1;border-radius:8px;width:216px}</style>
+<div id="r"></div>
+<script type="module">
+import { renderCharacterPreview, preloadAppearance } from '../src/game/draw/character.ts';
+import { DEFAULT_APPEARANCE } from '../src/config/wardrobe.ts';
+const variants = [
+  {}, { hairStyle: 'long', hairColor: 'hc-blond', top: 'tee-coral', bottom: 'skirt-plum', shoes: 'boots-brown', skin: 'skin-1', accessory: 'glasses' },
+  { hairStyle: 'spiky', hairColor: 'hc-blue', top: 'jacket-navy', bottom: 'pants-black', skin: 'skin-4', accessory: 'headphones' },
+  { hairStyle: 'curly', hairColor: 'hc-red', top: 'tee-mint', bottom: 'shorts-sand', shoes: 'sneakers-red', skin: 'skin-5', accessory: 'scarf' },
+  { hairStyle: 'bun', hairColor: 'hc-pink', top: 'hoodie-gray', accessory: 'cap' }, { hairStyle: 'ponytail', hairColor: 'hc-black', top: 'jacket-mustard', skin: 'skin-3' },
+];
+const root = document.getElementById('r');
+for (const v of variants) {
+  const a = { ...DEFAULT_APPEARANCE, ...v };
+  await preloadAppearance(a);
+  const row = document.createElement('div'); row.className = 'row'; root.append(row);
+  for (const [view, anim, f] of [['f', 'idle', 0], ['f', 'walk', 1], ['f', 'interact', 1], ['b', 'idle', 0], ['f', 'sit', 0]]) row.append(renderCharacterPreview(a, view, anim, f, 3));
+}
+document.title = 'ready';
+</script>

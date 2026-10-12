@@ -8,7 +8,8 @@ import {
   releaseUnusedCharacterTextures, View,
 } from './draw/character';
 
-const SIT_DROP = 7; // насколько персонаж «проседает» на сиденье, px
+const SIT_DROP = 17;     // насколько спрайт опускается, чтобы бёдра пришлись на сиденье, px
+const CHAR_SCALE = 1.22; // размер персонажа относительно мебели
 
 /** Персонаж: контейнер из слоёв-спрайтов. Умеет ходить по пути, поворачиваться, играть анимации и садиться. */
 export class Player extends Phaser.GameObjects.Container {
@@ -32,9 +33,8 @@ export class Player extends Phaser.GameObjects.Container {
     this.gx = cell.x + 0.5;
     this.gy = cell.y + 0.5;
     this.appearance = { ...appearance };
-    ensureCharacterTextures(scene, this.appearance);
-
-    this.shadowImg = scene.add.image(0, 0, 'shadow').setScale(1 / SETTINGS.texScale * SETTINGS.texScale * 0.9);
+    // текстуры текущего образа к этому моменту уже подготовлены сценой (ensureCharacterTextures)
+    this.shadowImg = scene.add.image(0, 0, 'shadow').setScale(1.15);
     this.add(this.shadowImg);
     const sc = 1 / SETTINGS.texScale;
     for (const layer of LAYERS) {
@@ -43,6 +43,7 @@ export class Player extends Phaser.GameObjects.Container {
       this.layers.push(img);
       this.add(img);
     }
+    this.setScale(CHAR_SCALE);
     scene.add.existing(this);
     this.syncWorld();
   }
@@ -52,9 +53,14 @@ export class Player extends Phaser.GameObjects.Container {
   get isSitting(): boolean { return this.sitting; }
   get animName(): AnimName { return this.anim; }
 
-  setAppearance(a: Appearance): void {
+  private appearanceSeq = 0;
+
+  /** Применяет образ; текстуры готовятся асинхронно, до готовности виден прежний образ. */
+  async setAppearance(a: Appearance): Promise<void> {
+    const seq = ++this.appearanceSeq;
+    await ensureCharacterTextures(this.scene, a);
+    if (seq !== this.appearanceSeq || !this.scene) return;
     this.appearance = { ...a };
-    ensureCharacterTextures(this.scene, this.appearance);
     this.applyFrame();
   }
 

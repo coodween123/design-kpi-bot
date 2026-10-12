@@ -48,12 +48,35 @@ export class Iso {
     }
   }
 
-  /** Коробка: видны верх, грань +y (слева на экране) и грань +x (справа на экране). */
+  /** Коробка: видны верх, грань +y (слева на экране) и грань +x (справа на экране). С градиентами и бликом на рёбрах. */
   box(u0: number, v0: number, z0: number, du: number, dv: number, dz: number, pl: BoxPal, stroke: string | null = OUTLINE): void {
     const u1 = u0 + du, v1 = v0 + dv, z1 = z0 + dz;
-    this.poly([this.p(u0, v1, z0), this.p(u1, v1, z0), this.p(u1, v1, z1), this.p(u0, v1, z1)], pl.left, stroke);
-    this.poly([this.p(u1, v0, z0), this.p(u1, v1, z0), this.p(u1, v1, z1), this.p(u1, v0, z1)], pl.right, stroke);
-    this.poly([this.p(u0, v0, z1), this.p(u1, v0, z1), this.p(u1, v1, z1), this.p(u0, v1, z1)], pl.top, stroke);
+    const grad = (a: Pt2, b: Pt2, c0: string, c1: string): CanvasGradient => this.lineGrad(a, b, [[0, c0], [1, c1]]);
+    this.poly([this.p(u0, v1, z0), this.p(u1, v1, z0), this.p(u1, v1, z1), this.p(u0, v1, z1)],
+      grad(this.p(u0, v1, z1), this.p(u0, v1, z0), shade(pl.left, 0.1), shade(pl.left, -0.16)), stroke);
+    this.poly([this.p(u1, v0, z0), this.p(u1, v1, z0), this.p(u1, v1, z1), this.p(u1, v0, z1)],
+      grad(this.p(u1, v1, z1), this.p(u1, v1, z0), shade(pl.right, 0.08), shade(pl.right, -0.18)), stroke);
+    this.poly([this.p(u0, v0, z1), this.p(u1, v0, z1), this.p(u1, v1, z1), this.p(u0, v1, z1)],
+      grad(this.p(u0, v0, z1), this.p(u1, v1, z1), shade(pl.top, 0.1), shade(pl.top, -0.07)), stroke);
+    if (dz > 2 && du > 0.12 && dv > 0.12) {
+      this.edge(this.p(u0, v1, z1), this.p(u1, v1, z1), 0.5);
+      this.edge(this.p(u1, v1, z1), this.p(u1, v0, z1), 0.28);
+    }
+  }
+
+  /** Тонкий светлый блик вдоль ребра. */
+  edge(a: Pt2, b: Pt2, alpha = 0.4, color = '255,255,255'): void {
+    const c = this.c;
+    c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]);
+    c.strokeStyle = `rgba(${color},${alpha})`; c.lineWidth = 1.1 * this.S; c.lineCap = 'round'; c.stroke();
+  }
+
+  /** Линии древесных волокон на верхней грани (вдоль оси u). */
+  grain(u0: number, v0: number, du: number, dv: number, z: number, color = '120,70,30', n = 5, alpha = 0.16): void {
+    for (let i = 1; i <= n; i++) {
+      const v = v0 + (dv * i) / (n + 1);
+      this.edge(this.p(u0 + du * 0.04, v, z), this.p(u0 + du * (0.55 + 0.4 * ((i * 37) % 10) / 10), v, z), alpha, color);
+    }
   }
 
   /** Прямоугольник на плоскости v = const (грань, обращённая к +y). */
@@ -66,10 +89,8 @@ export class Iso {
     this.poly([this.p(u, v0, z0), this.p(u, v1, z0), this.p(u, v1, z1), this.p(u, v0, z1)], fill, stroke);
   }
 
-  /** Мягкая тень на полу под предметом. */
-  shadow(u0: number, v0: number, du: number, dv: number, a = 0.16): void {
-    this.poly([this.p(u0 - 0.05, v0 - 0.05), this.p(u0 + du + 0.12, v0 - 0.05), this.p(u0 + du + 0.12, v0 + dv + 0.12), this.p(u0 - 0.05, v0 + dv + 0.12)], `rgba(60,30,40,${a})`, null);
-  }
+  /** Тени под мебелью отключены по решению заказчика (тень оставлена только у персонажа). Метод оставлен, чтобы не менять рисовалки. */
+  shadow(_u0: number, _v0: number, _du: number, _dv: number, _a = 0.16): void { /* без теней */ }
 
   ellipse(cx: number, cy: number, rx: number, ry: number, fill: string, stroke: string | null = null, rot = 0): void {
     const c = this.c, S = this.S;

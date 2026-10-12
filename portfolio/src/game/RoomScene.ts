@@ -5,7 +5,7 @@ import { Appearance } from '../config/wardrobe';
 import type { Bus } from '../bus';
 import { NavGrid, Cell } from './grid';
 import { gridToWorld, worldToGrid } from './iso';
-import { makeFurnitureTexture, makeMiscTextures, makeShellTexture, SHELL_BOUNDS } from './draw/textures';
+import { makeFurnitureTexture, makeMiscTextures, makeOutlineTexture, makeShellTexture, SHELL_BOUNDS } from './draw/textures';
 import { ensureCharacterTextures } from './draw/character';
 import { Player } from './Player';
 
@@ -13,7 +13,7 @@ interface Obj {
   def: FurnitureDef;
   sprite: Phaser.GameObjects.Image;
   glow?: Phaser.GameObjects.Image;
-  marker?: Phaser.GameObjects.Image;
+  outline?: Phaser.GameObjects.Image;
   depth: number;
 }
 
@@ -49,13 +49,13 @@ export class RoomScene extends Phaser.Scene {
 
   // ---------- построение мира (по шагам, чтобы показывать прогресс) ----------
   private async buildWorld(): Promise<void> {
-    const tasks: (() => void)[] = [];
+    const tasks: (() => void | Promise<void>)[] = [];
     const texs = new Map<string, ReturnType<typeof makeFurnitureTexture>>();
     tasks.push(() => { makeShellTexture(this); makeMiscTextures(this); });
-    for (const def of FURNITURE) tasks.push(() => texs.set(def.id, makeFurnitureTexture(this, def)));
+    for (const def of FURNITURE) tasks.push(() => { texs.set(def.id, makeFurnitureTexture(this, def)); });
     tasks.push(() => ensureCharacterTextures(this, this.appearance));
     for (let i = 0; i < tasks.length; i++) {
-      tasks[i]();
+      await tasks[i]();
       this.bus.emit('progress', (i + 1) / (tasks.length + 1));
       await new Promise((r) => setTimeout(r, 0));
     }
@@ -85,11 +85,12 @@ export class RoomScene extends Phaser.Scene {
         // мелкие плоские предметы (папка на столе) трудно поймать по пикселям — даём прямоугольную область
         if (def.h <= 20) sprite.setInteractive({ useHandCursor: true });
         else sprite.setInteractive({ pixelPerfect: true, alphaTolerance: 40, useHandCursor: true });
+        // подсветка при наведении: светящийся контур позади предмета + лёгкое осветление поверх
+        makeOutlineTexture(this, tex.key, `${tex.key}/o`);
+        obj.outline = this.add.image(sprite.x, sprite.y, `${tex.key}/o`).setOrigin(tex.originX, tex.originY).setScale(1 / SETTINGS.texScale)
+          .setAlpha(0).setDepth(depth - 0.01);
         obj.glow = this.add.image(sprite.x, sprite.y, tex.key).setOrigin(tex.originX, tex.originY).setScale(1 / SETTINGS.texScale)
           .setBlendMode(Phaser.BlendModes.ADD).setAlpha(0).setDepth(depth + 0.02);
-        const top = gridToWorld(def.gx + def.w / 2, def.gy + def.d / 2);
-        obj.marker = this.add.image(top.x, top.y - (def.z ?? 0) - def.h - 16, 'marker').setScale(1 / SETTINGS.texScale).setDepth(5000);
-        this.tweens.add({ targets: obj.marker, y: obj.marker.y - 5, duration: 700, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
         sprite.on('pointerover', () => this.setHover(def.id));
         sprite.on('pointerout', () => this.setHover(null, def.id));
       }
@@ -105,10 +106,11 @@ export class RoomScene extends Phaser.Scene {
     this.scale.on('resize', () => this.fit(false));
     this.bus.on('uiOpen', (open) => { this.uiOpen = open; if (open) this.setHover(null); });
     this.bus.on('inset', (i) => { this.inset = i; this.fit(true); });
-    this.bus.on('preview', (a) => { this.appearance = a; this.player.setAppearance(a); });
+    this.bus.on('preview', (a) => { this.appearance = a; void this.player.setAppearance(a).then(() => this.player.trimTextures([])); });
     this.fit(false);
     this.cameras.main.setAlpha(0);
     this.tweens.add({ targets: this.cameras.main, alpha: 1, duration: 500 });
+    this.introPulse();
   }
 
   private blockFootprint(def: FurnitureDef): void {
@@ -200,20 +202,36 @@ export class RoomScene extends Phaser.Scene {
   private setHover(id: string | null, leaving?: string): void {
     if (id === null && leaving && this.hoverId !== leaving) return;
     this.hoverId = id;
-    for (const o of this.objs.values()) o.glow?.setAlpha(o.def.id === id || o.def.id === this.selectedId ? 0.28 : 0);
+    for (const o of this.objs.values()) this.setLit(o, o.def.id === id || o.def.id === this.selectedId);
     if (id) this.tile.setVisible(false);
     const o = id ? this.objs.get(id) : null;
     if (o) {
       const d = o.def;
       const c = gridToWorld(d.gx + d.w / 2, d.gy + d.d / 2);
-      const s = this.toScreen(c.x, c.y - (d.z ?? 0) - d.h - 36);
+      const s = this.toScreen(c.x, c.y - (d.z ?? 0) - (d.markerZ ?? d.h) - 40);
       this.bus.emit('hover', { label: o.def.interactive!.hint, x: s.x, y: s.y });
     } else this.bus.emit('hover', { label: null, x: 0, y: 0 });
   }
 
+  private setLit(o: Obj, on: boolean): void {
+    if (!o.outline) return;
+    this.tweens.killTweensOf([o.outline, o.glow]);
+    this.tweens.add({ targets: o.outline, alpha: on ? 1 : 0, duration: 140 });
+    this.tweens.add({ targets: o.glow, alpha: on ? 0.2 : 0, duration: 140 });
+  }
+
+  /** Один раз при старте коротко подсвечивает все интерактивные предметы — чтобы было видно, на что можно нажать. */
+  private introPulse(): void {
+    let i = 0;
+    for (const o of this.objs.values()) {
+      if (!o.outline) continue;
+      this.tweens.add({ targets: o.outline, alpha: 1, duration: 260, yoyo: true, hold: 220, delay: 700 + i++ * 140, ease: 'Sine.easeInOut' });
+    }
+  }
+
   private select(id: string | null): void {
     this.selectedId = id;
-    for (const o of this.objs.values()) o.glow?.setAlpha(o.def.id === id || o.def.id === this.hoverId ? 0.28 : 0);
+    for (const o of this.objs.values()) this.setLit(o, o.def.id === id || o.def.id === this.hoverId);
     const o = id ? this.objs.get(id) : null;
     this.bus.emit('selected', o ? { id: o.def.id, label: o.def.interactive!.hint } : null);
   }
@@ -289,7 +307,6 @@ export class RoomScene extends Phaser.Scene {
     }
     const status = this.player.isSitting ? 'sitting' : this.player.isMoving ? 'walking' : this.player.animName === 'interact' ? 'acting' : 'idle';
     if (status !== this.lastStatus) { this.lastStatus = status; this.bus.emit('status', status as 'idle'); }
-    for (const o of this.objs.values()) o.marker?.setVisible(!this.uiOpen);
   }
 
   /**
@@ -374,6 +391,12 @@ export class RoomScene extends Phaser.Scene {
   clientPosOfCell(x: number, y: number): { x: number; y: number } {
     const w = gridToWorld(x + 0.5, y + 0.5);
     const s = this.toScreen(w.x, w.y);
+    const r = this.scale.canvas.getBoundingClientRect();
+    return { x: r.left + s.x, y: r.top + s.y };
+  }
+  clientPosOfPoint(gx: number, gy: number, z: number): { x: number; y: number } {
+    const w = gridToWorld(gx, gy);
+    const s = this.toScreen(w.x, w.y - z);
     const r = this.scale.canvas.getBoundingClientRect();
     return { x: r.left + s.x, y: r.top + s.y };
   }

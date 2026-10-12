@@ -38,15 +38,20 @@ export interface FurnitureDef {
   on?: string;              // id предмета-опоры (рисуется поверх него)
   /** высота спрайта, px (для расчёта размера текстуры) */
   h: number;
+  /** высота значка-указателя над основанием, px (по умолчанию = h) */
+  markerZ?: number;
   interactive?: InteractiveDef;
 }
 
 export const FURNITURE: FurnitureDef[] = [
   // --- стены (декор) ---
   { id: 'window-left', label: 'Окно', kind: 'window', gx: 0, gy: 4.2, w: 0, d: 1.7, h: 150, wall: true, blocks: false },
-  { id: 'frames-right', label: 'Рамки', kind: 'frames', gx: 2.2, gy: 0, w: 2.4, d: 0, h: 150, wall: true, blocks: false },
   {
-    id: 'door', label: 'Дверь', kind: 'door', gx: 0, gy: 7.85, w: 0, d: 1.4, h: 150, wall: true, blocks: false,
+    id: 'frames-right', label: 'Награды', kind: 'frames', gx: 2.2, gy: 0, w: 2.4, d: 0, h: 150, wall: true, blocks: false, markerZ: 142,
+    interactive: { enabled: true, hint: 'Обо мне', approach: [{ x: 4, y: 1 }, { x: 2, y: 1 }], face: [0, -1], action: { type: 'modal', section: 'about' } },
+  },
+  {
+    id: 'door', label: 'Дверь', kind: 'door', gx: 0, gy: 7.85, w: 0, d: 1.4, h: 150, wall: true, blocks: false, markerZ: 132,
     interactive: { enabled: true, hint: 'Контакты', approach: [{ x: 0, y: 8 }, { x: 1, y: 8 }], face: [-1, 0], action: { type: 'modal', section: 'contacts' } },
   },
   // --- мебель ---
@@ -61,6 +66,10 @@ export const FURNITURE: FurnitureDef[] = [
   },
   { id: 'rug', label: 'Ковёр', kind: 'rug', gx: 3, gy: 3.2, w: 3.4, d: 3.4, h: 6, blocks: false },
   { id: 'coffee-table', label: 'Журнальный столик', kind: 'coffeeTable', gx: 2, gy: 4.2, w: 1, d: 1.6, h: 40 },
+  {
+    id: 'catalog', label: 'Каталог услуг', kind: 'catalog', gx: 2.3, gy: 4.55, w: 0.56, d: 0.6, z: 23, h: 12, blocks: false, on: 'coffee-table',
+    interactive: { enabled: true, hint: 'Услуги', approach: [{ x: 3, y: 4 }, { x: 3, y: 5 }], face: [-1, 0], action: { type: 'modal', section: 'services' } },
+  },
   { id: 'desk', label: 'Стол', kind: 'desk', gx: 2, gy: 0, w: 3, d: 1, h: 50 },
   { id: 'chair', label: 'Стул', kind: 'chair', gx: 3, gy: 1, w: 1, d: 1, h: 70 },
   {
@@ -68,12 +77,8 @@ export const FURNITURE: FurnitureDef[] = [
     interactive: { enabled: true, hint: 'Проекты', approach: [{ x: 2, y: 1 }, { x: 4, y: 1 }], face: [0, -1], action: { type: 'modal', section: 'projects' } },
   },
   {
-    id: 'document', label: 'Резюме', kind: 'document', gx: 3.95, gy: 0.2, w: 0.65, d: 0.65, z: 40, h: 12, blocks: false, on: 'desk',
-    interactive: { enabled: true, hint: 'Резюме', approach: [{ x: 4, y: 1 }, { x: 2, y: 1 }], face: [0, -1], action: { type: 'modal', section: 'resume' } },
-  },
-  {
     id: 'tv', label: 'Телевизор', kind: 'tv', gx: 6, gy: 0, w: 2, d: 1, h: 110,
-    interactive: { enabled: true, hint: 'Видео', approach: [{ x: 6, y: 1 }, { x: 7, y: 1 }], face: [0, -1], action: { type: 'panel', section: 'video' } },
+    interactive: { enabled: true, hint: 'Telegram-канал', approach: [{ x: 6, y: 1 }, { x: 7, y: 1 }], face: [0, -1], action: { type: 'panel', section: 'telegram' } },
   },
   { id: 'bookshelf', label: 'Стеллаж', kind: 'bookshelf', gx: 8, gy: 0, w: 1, d: 1, h: 130 },
   { id: 'plant', label: 'Растение', kind: 'plant', gx: 9, gy: 0, w: 1, d: 1, h: 110 },

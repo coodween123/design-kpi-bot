@@ -36,6 +36,8 @@ export const WARDROBE: WardrobeCategory[] = [
       { id: 'long', label: 'Длинные', style: 'long' },
       { id: 'spiky', label: 'Ёжик', style: 'spiky' },
       { id: 'bun', label: 'Пучок', style: 'bun' },
+      { id: 'ponytail', label: 'Хвост', style: 'ponytail' },
+      { id: 'curly', label: 'Кудри', style: 'curly' },
     ],
   },
   {

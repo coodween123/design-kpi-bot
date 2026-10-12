@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>Лист причёсок</title>
+<style>body{margin:0;background:#1d5a8f;font:12px sans-serif;color:#fff}.row{display:flex;gap:6px;padding:6px;flex-wrap:wrap}canvas{background:#e9f4f1;border-radius:8px}</style>
+<div id="r"></div>
+<script type="module">
+import { HAIR_STYLES, preloadHair, hairImage } from '../src/game/draw/hair.ts';
+const colors = ['#2b2230', '#6a4330', '#e2bf6b', '#c55a2b', '#e06fa5', '#4aa3df'];
+const S = 4, W = 72, H = 90;
+function head(c, back) {
+  c.fillStyle = '#f3c19b'; c.strokeStyle = 'rgba(52,30,44,.6)'; c.lineWidth = 1.4;
+  c.beginPath(); c.ellipse(36, 26, 15, 14.5, 0, 0, 7); c.fill(); c.stroke();
+  c.fillRect(31, 38, 10, 10);
+  c.fillStyle = '#3a4a8a'; c.beginPath(); c.roundRect(22, 44, 28, 40, 8); c.fill();
+  if (!back) { c.fillStyle = '#2d2030'; for (const x of [30, 42]) { c.beginPath(); c.ellipse(x, 29, 2.3, 3.2, 0, 0, 7); c.fill(); } }
+}
+const root = document.getElementById('r');
+for (const color of colors.slice(0, +new URLSearchParams(location.search).get('n') || 6)) {
+  const row = document.createElement('div'); row.className = 'row'; root.append(row);
+  for (const st of HAIR_STYLES) {
+    await preloadHair(st, color);
+    for (const back of [false, true]) {
+      const cv = document.createElement('canvas'); cv.width = W * S; cv.height = H * S; cv.style.width = W * 2 + 'px';
+      const c = cv.getContext('2d'); c.scale(S, S);
+      if (!back) { const b = hairImage(st, color, 'behind'); if (b) c.drawImage(b, 0, 0, 72, 108); }
+      head(c, back);
+      const o = hairImage(st, color, back ? 'back' : 'over'); if (o) c.drawImage(o, 0, 0, 72, 108);
+      row.append(cv);
+    }
+  }
+}
+document.title = 'ready';
+</script>

@@ -28,6 +28,22 @@ export function makeFurnitureTexture(scene: Phaser.Scene, def: FurnitureDef): Fu
   return { key, originX: ox / W, originY: oy / Hh };
 }
 
+/** Светящийся контур предмета (для подсветки при наведении): силуэт, расширенный на r px, залитый цветом. */
+export function makeOutlineTexture(scene: Phaser.Scene, srcKey: string, outKey: string, r = 3): void {
+  if (scene.textures.exists(outKey)) return;
+  const src = scene.textures.get(srcKey).getSourceImage() as HTMLCanvasElement;
+  const S = SETTINGS.texScale;
+  const cv = document.createElement('canvas');
+  cv.width = src.width; cv.height = src.height;
+  const c = cv.getContext('2d')!;
+  const rr = r * S;
+  for (let a = 0; a < 16; a++) c.drawImage(src, Math.cos((a / 16) * Math.PI * 2) * rr, Math.sin((a / 16) * Math.PI * 2) * rr);
+  c.globalCompositeOperation = 'source-in';
+  c.fillStyle = '#fff4a8';
+  c.fillRect(0, 0, cv.width, cv.height);
+  scene.textures.addCanvas(outKey, cv);
+}
+
 export function makeShellTexture(scene: Phaser.Scene): string {
   const key = 'shell';
   if (!scene.textures.exists(key)) scene.textures.addCanvas(key, drawShell());
@@ -56,12 +72,5 @@ export function makeMiscTextures(scene: Phaser.Scene): void {
     c.beginPath(); c.moveTo(32, 1.5); c.lineTo(62.5, 16); c.lineTo(32, 30.5); c.lineTo(1.5, 16); c.closePath();
     c.fillStyle = 'rgba(255,255,255,0.28)'; c.fill();
     c.strokeStyle = 'rgba(255,255,255,0.9)'; c.lineWidth = 2; c.stroke();
-  });
-  mk('marker', 26, 30, (c) => {
-    c.beginPath(); c.moveTo(13, 28); c.lineTo(3, 12); c.quadraticCurveTo(0, 4, 8, 2); c.quadraticCurveTo(13, 0.5, 18, 2);
-    c.quadraticCurveTo(26, 4, 23, 12); c.closePath();
-    c.fillStyle = '#ffffff'; c.fill();
-    c.strokeStyle = '#3b2b4a'; c.lineWidth = 2; c.lineJoin = 'round'; c.stroke();
-    c.beginPath(); c.arc(13, 11, 4.2, 0, Math.PI * 2); c.fillStyle = '#ec7766'; c.fill();
   });
 }

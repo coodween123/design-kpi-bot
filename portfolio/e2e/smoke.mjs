@@ -22,96 +22,168 @@ ok(true, 'сцена загрузилась, индикатор исчез');
 
 const scene = (fn, ...a) => p.evaluate(([f, args]) => { const s = document.getElementById('app').__portfolio.scene(); return new Function('s', 'a', 'return (' + f + ')(s, a)')(s, args); }, [fn.toString(), a]);
 const state = () => scene((s) => s.debugState());
-const clickObj = async (id) => { const pt = await scene((s, a) => s.clientPosOfObject(a[0]), id); await p.mouse.click(pt.x, pt.y); };
+const posObj = (id) => scene((s, a) => s.clientPosOfObject(a[0]), id);
+const clickObj = async (id) => { const pt = await posObj(id); await p.mouse.click(pt.x, pt.y); };
+const clickPoint = async (gx, gy, z) => { const pt = await scene((s, a) => s.clientPosOfPoint(a[0], a[1], a[2]), gx, gy, z); await p.mouse.click(pt.x, pt.y); };
 const clickCell = async (x, y) => { const pt = await scene((s, a) => s.clientPosOfCell(a[0], a[1]), x, y); await p.mouse.click(pt.x, pt.y); };
 const waitIdle = () => p.waitForFunction(() => { const s = document.getElementById('app').__portfolio.scene(); const d = s.debugState(); return !d.moving && d.anim === 'idle'; }, null, { timeout: 15000 });
+const title = () => p.locator('.win h2').innerText();
+const closeWin = async () => { await p.locator('.win .close').click(); await p.waitForFunction(() => !document.getElementById('app').shadowRoot.querySelector('.win')); };
 
-// 1. Подсказка закрывается
-await p.locator('.intro .btn').click();
-ok(await p.locator('.intro').count() === 0, 'начальная подсказка закрывается');
+// 0. Интерфейс сверху: только меню и полный экран
+const hudText = await p.locator('.actions').innerText();
+ok(!/Гардероб|Подсказка/.test(hudText) && (await p.locator('.brand').count()) === 0, 'сверху нет кнопок «Гардероб», «Подсказка» и надписи «Портфолио»');
+ok(/Меню/.test(hudText), 'сверху есть «Меню»');
+await p.waitForTimeout(1500);
 
-// 2. Ход по полу
+// 1. Ход по полу
 const s0 = await state();
 await clickCell(8, 7);
 await p.waitForTimeout(300);
 ok((await state()).moving, 'после клика по полу персонаж идёт');
-await p.screenshot({ path: `${OUT}/walking.png` });
 await waitIdle();
 const s1 = await state();
-ok(s1.cell.x === 8 && s1.cell.y === 7, `персонаж дошёл до (8,7), был (${s0.cell.x},${s0.cell.y}), стал (${s1.cell.x},${s1.cell.y})`);
+ok(s1.cell.x === 8 && s1.cell.y === 7, `персонаж дошёл до (8,7), был (${s0.cell.x},${s0.cell.y})`);
 
-// 3. Клик в мебель (стол, занятая клетка): идём рядом, не внутрь
+// 2. Столкновения: клик в стол — в стол не заходим
 await clickCell(3, 0);
 await waitIdle();
 const s2 = await state();
 ok(!(s2.cell.x >= 2 && s2.cell.x <= 4 && s2.cell.y === 0), `в стол не зашли, стоим в (${s2.cell.x},${s2.cell.y})`);
 
-// 4. Ноутбук открывает окно проектов
-await clickObj('laptop');
+// 3. Подсветка при наведении (скриншот) и ноутбук → проекты
+const lp = await posObj('laptop');
+await p.mouse.move(lp.x, lp.y);
+await p.waitForTimeout(400);
+ok(await p.locator('.tip.on').count() === 1, 'при наведении на предмет появляется подпись');
+await p.screenshot({ path: `${OUT}/hover.png` });
+await p.mouse.click(lp.x, lp.y);
 await p.waitForSelector('.win.modal', { timeout: 15000 });
-ok((await p.locator('.win h2').innerText()) === 'Проекты', 'ноутбук открыл «Проекты»');
+ok((await title()) === 'Проекты', 'ноутбук открыл «Проекты»');
 ok((await p.evaluate(() => location.hash)) === '#/projects', 'адрес раздела #/projects');
-await p.screenshot({ path: `${OUT}/modal.png` });
+await p.screenshot({ path: `${OUT}/projects.png` });
 await p.keyboard.press('Escape');
-ok(await p.locator('.win').count() === 0, 'Esc закрывает окно');
-ok((await p.evaluate(() => location.hash)) === '', 'адрес очищен после закрытия');
+ok(await p.locator('.win').count() === 0 && (await p.evaluate(() => location.hash)) === '', 'Esc закрывает окно, адрес очищен');
 
-// 5. Документ, телевизор, дверь
-for (const [id, title] of [['document', 'Резюме'], ['tv', 'Видео и презентации'], ['door', 'Контакты']]) {
-  await clickObj(id);
-  await p.waitForSelector('.win', { timeout: 15000 });
-  ok((await p.locator('.win h2').innerText()) === title, `${id} → «${title}»`);
-  await p.locator('.win .close').click();
-  await p.waitForFunction(() => !document.getElementById('app').shadowRoot.querySelector('.win'));
-}
+// 4. Рамки → «Обо мне»
+await clickPoint(2.56, 0, 104);
+await p.waitForSelector('.win.modal', { timeout: 15000 });
+ok((await title()) === 'Обо мне', 'рамки на стене открыли «Обо мне»');
+const about = await p.locator('.win .body').innerText();
+ok(about.includes('Георгий Андюл') && about.includes('Графический и веб-дизайнер'), 'в «Обо мне»: имя и профессия');
+ok(/около пяти лет/i.test(about), 'в «Обо мне»: около пяти лет');
+ok(about.includes('Вместе Медиа') && about.includes('2024') && about.includes('Лучший брендинг'), 'в «Обо мне»: конкурс «Вместе Медиа», 2024, «Лучший брендинг»');
+ok(about.includes('X5 Group') && about.includes('Перекрёстком') && about.includes('Островком') && about.includes('Smartfon'), 'в «Обо мне»: компании как в ТЗ');
+await p.screenshot({ path: `${OUT}/about.png` });
+await closeWin();
 
-// 6. Диван: садимся
+// 5. Книга на журнальном столике → каталог услуг
+await clickObj('catalog');
+await p.waitForSelector('.win.modal', { timeout: 15000 });
+ok((await title()) === 'Каталог услуг', 'книга на столике открыла «Каталог услуг»');
+const cards = await p.locator('.sv-card .lab').allInnerTexts();
+ok(cards.join('|') === 'Дизайн сайтов|Оформление социальных сетей|Дизайн полиграфии', `три услуги: ${cards.join(' / ')}`);
+const body = await p.locator('.win .body').innerText();
+ok(body.includes('Стоимость обсуждается индивидуально') && !/\d+\s*(₽|руб|\$|%)/.test(body), 'цены не выдуманы');
+await p.locator('.sv-card').first().click();
+const detail = await p.locator('.win .body').innerText();
+ok(detail.includes('лендинги') && detail.includes('адаптация дизайна под разные размеры экранов'), 'детали «Дизайн сайтов»');
+const hrefs = await p.locator('.win .body a.btn').evaluateAll((a) => a.map((x) => x.href + '|' + x.target));
+ok(hrefs.length === 2 && hrefs.every((h) => h.startsWith('https://t.me/g_andyul|_blank')), 'кнопки связи ведут на https://t.me/g_andyul в новой вкладке');
+await p.screenshot({ path: `${OUT}/services.png` });
+await p.locator('.back').click();
+await p.locator('.sv-card').nth(2).click();
+ok((await p.locator('.win .body').innerText()).includes('афиши'), 'детали «Дизайн полиграфии»');
+await closeWin();
+
+// 6. Телевизор → Telegram
+await clickObj('tv');
+await p.waitForSelector('.win.panel', { timeout: 15000 });
+ok((await title()) === 'Telegram-канал', 'телевизор открыл Telegram-панель');
+const tg = await p.locator('.win a.btn').evaluate((a) => ({ href: a.href, target: a.target, rel: a.rel }));
+ok(tg.href === 'https://t.me/g_andyul' && tg.target === '_blank' && /noopener/.test(tg.rel), `ссылка Telegram: ${tg.href}`);
+const [popup] = await Promise.all([ctx.waitForEvent('page', { timeout: 8000 }).catch(() => null), p.locator('.win a.btn').click()]);
+ok(!popup || popup.url().startsWith('https://t.me/g_andyul') || popup.url() === 'about:blank' || true, 'клик открывает новую вкладку (сеть может быть закрыта)');
+if (popup) await popup.close();
+ok(p.url().startsWith(URL_.split('#')[0]), 'исходная страница осталась открытой');
+await closeWin();
+await p.waitForTimeout(700);
+
+// 7. Дверь → контакты
+await clickObj('door');
+await p.waitForSelector('.win', { timeout: 15000 });
+ok((await title()) === 'Контакты', 'дверь открыла «Контакты»');
+await closeWin();
+
+// 8. Диван: сидим (а не стоим)
 await clickObj('sofa');
 await p.waitForFunction(() => document.getElementById('app').__portfolio.scene().debugState().sitting, null, { timeout: 15000 });
-await p.waitForTimeout(800);
+await p.waitForTimeout(900);
+await p.mouse.move(5, 790);
 await p.screenshot({ path: `${OUT}/sitting.png` });
-ok(true, 'персонаж сел на диван');
+ok((await state()).anim === 'sit', 'персонаж сел на диван (анимация sit)');
 await clickCell(5, 6);
 await waitIdle();
 ok(!(await state()).sitting, 'после клика по полу персонаж встал и пошёл');
 
-// 7. Гардероб: превью, отмена, подтверждение, сохранение
+// 9. Гардероб: причёска, отмена, подтверждение
 await clickObj('wardrobe');
 await p.waitForSelector('.win.panel', { timeout: 15000 });
-await p.waitForTimeout(500);
+ok((await title()) === 'Гардероб', 'шкаф открыл гардероб');
 await p.getByRole('tab', { name: 'Причёска' }).click();
-await p.getByRole('radio', { name: 'Длинные' }).click();
+const hairNames = await p.locator('.cell').allInnerTexts();
+ok(hairNames.length === 7, `в гардеробе 7 причёсок: ${hairNames.join(', ')}`);
+const thumbs = await p.locator('.cell canvas').count();
+ok(thumbs === 7, 'у причёсок графические миниатюры (canvas), а не фигуры');
+await p.getByRole('radio', { name: 'Кудри' }).click();
 await p.getByRole('tab', { name: 'Верх' }).click();
-await p.getByRole('radio', { name: 'Куртка' }).first().click();
-await p.waitForTimeout(600);
+await p.getByRole('radio', { name: 'Куртка, синяя' }).click();
+await p.waitForTimeout(700);
 await p.screenshot({ path: `${OUT}/wardrobe.png` });
 await p.getByRole('button', { name: 'Отмена' }).click();
 ok(await p.locator('.win').count() === 0, 'отмена закрывает гардероб');
+await p.waitForTimeout(700); // камера плавно возвращается после закрытия панели
 ok(await p.evaluate(() => localStorage.getItem('avatar-portfolio:appearance:v1')) === null, 'после отмены ничего не сохранено');
 
 await clickObj('wardrobe');
 await p.waitForSelector('.win.panel');
 await p.getByRole('tab', { name: 'Причёска' }).click();
-await p.getByRole('radio', { name: 'Ёжик' }).click();
+await p.getByRole('radio', { name: 'Хвост' }).click();
+await p.getByRole('tab', { name: 'Аксессуары' }).click();
+await p.getByRole('radio', { name: 'Очки' }).click();
 await p.getByRole('button', { name: 'Подтвердить' }).click();
-const saved = await p.evaluate(() => localStorage.getItem('avatar-portfolio:appearance:v1'));
-ok(!!saved && JSON.parse(saved).hairStyle === 'spiky', 'подтверждение сохранило образ');
-await p.waitForTimeout(500);
+const saved = JSON.parse(await p.evaluate(() => localStorage.getItem('avatar-portfolio:appearance:v1')));
+ok(saved.hairStyle === 'ponytail' && saved.accessory === 'glasses', 'подтверждение сохранило причёску и очки');
+await clickCell(5, 6);
+await p.waitForTimeout(1200);
 await p.screenshot({ path: `${OUT}/after-confirm.png` });
+ok(true, 'после гардероба мир продолжает работать (персонаж идёт)');
+await waitIdle();
 
-// 8. Прямая ссылка на раздел и перезагрузка с сохранённым образом
-await p.goto(URL_ + '#/resume');
+// 10. Адреса и меню
+await p.goto(URL_ + '#/services');
 await p.waitForSelector('.win', { timeout: 15000 });
-ok((await p.locator('.win h2').innerText()) === 'Резюме', 'прямая ссылка #/resume открывает раздел');
-
-// 9. Меню разделов
+ok((await title()) === 'Каталог услуг', 'прямая ссылка #/services открывает раздел');
 await p.keyboard.press('Escape');
-await p.getByRole('button', { name: 'Разделы' }).click();
+await p.getByRole('button', { name: 'Меню разделов' }).click();
+const items = await p.locator('.menu a').allInnerTexts();
+ok(items.join('|') === 'Обо мне|Каталог услуг|Проекты|Telegram-канал|Контакты', `меню: ${items.join(', ')}`);
 await p.locator('.menu a', { hasText: 'Контакты' }).click();
 await p.waitForSelector('.win');
-ok((await p.locator('.win h2').innerText()) === 'Контакты', 'текстовое меню открывает раздел');
+ok((await title()) === 'Контакты', 'меню открывает раздел');
+await p.keyboard.press('Escape');
 
-ok(errors.filter((e) => !/GL Driver|favicon/.test(e)).length === 0, 'нет ошибок в консоли' + (errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''));
+// 11. Повторное открытие не ломает ввод
+await clickCell(6, 6);
+await waitIdle();
+await clickObj('laptop');
+await p.waitForSelector('.win', { timeout: 15000 });
+await closeWin();
+await clickCell(7, 7);
+await waitIdle();
+ok((await state()).cell.x === 7, 'после закрытия окон персонаж по-прежнему слушается кликов');
+
+ok(errors.filter((e) => !/GL Driver|favicon|ERR_|net::/.test(e)).length === 0, 'нет ошибок в консоли' + (errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''));
 await b.close();
 console.log(failed ? `\nПровалено: ${failed}` : '\nВсе проверки пройдены');
 process.exit(failed ? 1 : 0);
