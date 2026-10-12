@@ -8,7 +8,8 @@
     "build": "tsc --noEmit && vite build && vite build --config vite.embed.config.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "e2e": "node e2e/smoke.mjs"
+    "e2e": "node e2e/smoke.mjs",
+    "release": "vite build --config vite.embed.config.ts && cp dist-embed/portfolio-embed.js release/portfolio-embed.js"
   },
   "dependencies": {
     "phaser": "^3.90.0"
