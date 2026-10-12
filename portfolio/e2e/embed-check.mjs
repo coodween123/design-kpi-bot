@@ -1,0 +1,11 @@
+import { chromium } from 'playwright-core';
+const b = await chromium.launch({ executablePath: '/opt/pw-browsers/chromium-1194/chrome-linux/chrome', args: ['--use-gl=swiftshader', '--enable-unsafe-swiftshader'] });
+const p = await b.newPage({ viewport: { width: 1100, height: 900 } });
+const errs = []; p.on('pageerror', (e) => errs.push(e.message));
+await p.goto(process.argv[2]);
+await p.waitForFunction(() => { const h = document.querySelector('[data-avatar-portfolio]'); const s = h?.shadowRoot; return s && s.querySelector('canvas') && !s.querySelector('.loader'); }, null, { timeout: 15000 });
+await p.waitForTimeout(800);
+await p.locator('[data-avatar-portfolio] .btn', { hasText: 'Понятно' }).click();
+await p.screenshot({ path: process.argv[3] });
+console.log(errs.length ? 'ERRORS ' + errs.join('|') : 'embed ok, no page errors');
+await b.close();
