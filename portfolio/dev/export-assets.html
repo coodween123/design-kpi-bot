@@ -1,0 +1,19 @@
+<!doctype html><meta charset="utf-8"><title>Экспорт картинок для Figma</title>
+<script type="module">
+import { renderCharacterPreview, renderCharacterCrop, preloadAppearance } from '../src/game/draw/character.ts';
+import { HAIR_STYLES, preloadHair } from '../src/game/draw/hair.ts';
+import { DEFAULT_APPEARANCE, GEORGY_APPEARANCE, WARDROBE, findItem } from '../src/config/wardrobe.ts';
+const out = {};
+const png = (cv) => cv.toDataURL('image/png').split(',')[1];
+await preloadAppearance(GEORGY_APPEARANCE); await preloadAppearance(DEFAULT_APPEARANCE);
+out.portrait_georgy = png(renderCharacterPreview(GEORGY_APPEARANCE, 'f', 'idle', 0, 3));
+out.portrait_default = png(renderCharacterPreview(DEFAULT_APPEARANCE, 'f', 'idle', 0, 3));
+const hairCol = findItem('hairColor', DEFAULT_APPEARANCE.hairColor).color;
+await Promise.all(HAIR_STYLES.map((s) => preloadHair(s, hairCol)));
+const hair = WARDROBE.find((c) => c.id === 'hairStyle').items;
+hair.forEach((it, i) => { out['hair_' + i] = png(renderCharacterCrop({ ...DEFAULT_APPEARANCE, hairStyle: it.id }, 10, 0, 52, 64, 3)); });
+const tops = WARDROBE.find((c) => c.id === 'top').items;
+tops.forEach((it, i) => { out['top_' + i] = png(renderCharacterCrop({ ...DEFAULT_APPEARANCE, top: it.id }, 8, 44, 56, 46, 3)); });
+window.__out = out; window.__names = { hair: hair.map((h) => h.label), top: tops.map((t) => t.label) };
+document.title = 'ready';
+</script>
