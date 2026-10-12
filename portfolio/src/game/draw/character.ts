@@ -15,7 +15,7 @@ export const ANIMS: Record<AnimName, { frames: number; fps: number; loop: boolea
   interact: { frames: 4, fps: 8, loop: false },
   sit: { frames: 1, fps: 1, loop: true },
 };
-export const LAYERS = ['hairBack', 'body', 'bottom', 'shoes', 'top', 'hairFront', 'accessory'] as const;
+export const LAYERS = ['hairBack', 'body', 'beard', 'bottom', 'shoes', 'top', 'hairFront', 'accessory'] as const;
 export type Layer = (typeof LAYERS)[number];
 
 const TOP = 8;                              // запас над головой для причёсок
@@ -23,7 +23,7 @@ export const CHAR_W = 72;
 export const CHAR_H = 108 + TOP;
 export const CHAR_ORIGIN = { x: 36, y: 100 + TOP }; // точка «стоит на полу»
 
-interface Look { skin: string; hairStyle: string; hairColor: string; top: { style: string; color: string }; bottom: { style: string; color: string }; shoes: { style: string; color: string }; acc: { style: string; color: string } }
+interface Look { skin: string; hairStyle: string; hairColor: string; brows: string; beard: string; top: { style: string; color: string }; bottom: { style: string; color: string }; shoes: { style: string; color: string }; acc: { style: string; color: string } }
 
 export function resolveLook(a: Appearance): Look {
   const it = (cat: 'top' | 'bottom' | 'shoes' | 'accessory') => {
@@ -34,6 +34,8 @@ export function resolveLook(a: Appearance): Look {
     skin: findItem('skin', a.skin).color!,
     hairStyle: findItem('hairStyle', a.hairStyle).style!,
     hairColor: findItem('hairColor', a.hairColor).color!,
+    brows: findItem('brows', a.brows).style ?? 'normal',
+    beard: findItem('beard', a.beard).style ?? 'none',
     top: it('top'), bottom: it('bottom'), shoes: it('shoes'), acc: it('accessory'),
   };
 }
@@ -43,7 +45,8 @@ export function layerSignature(layer: Layer, a: Appearance): string {
   const l = resolveLook(a);
   switch (layer) {
     case 'hairBack': case 'hairFront': return `${layer}|${l.hairStyle}|${l.hairColor}`;
-    case 'body': return `body|${l.skin}`;
+    case 'body': return `body|${l.skin}|${l.brows}|${l.hairColor}`;
+    case 'beard': return `beard|${l.beard}|${l.hairColor}|${l.skin}`;
     case 'bottom': return `bottom|${l.bottom.style}|${l.bottom.color}`;
     case 'shoes': return `shoes|${l.shoes.style}|${l.shoes.color}`;
     case 'top': return `top|${l.top.style}|${l.top.color}`;
@@ -75,15 +78,16 @@ interface Geo { legX: [number, number]; knee: ([number, number] | null)[]; foot:
 function geometry(p: Pose, view: View): Geo {
   const hipY = 68;
   const legX: [number, number] = [30.5, 41.5];
-  // сидение: бёдра вперёд (по направлению взгляда), колени согнуты, голени вертикально; сзади ноги скрыты телом
-  const knee = [0, 1].map((i) => (p.sit && view === 'f' ? ([legX[i] + 10, 75] as [number, number]) : null));
+  // сидение: бёдра направлены к зрителю (сильно укорочены), колени согнуты, голени вертикально, ноги чуть врозь; сзади ноги скрыты телом
+  const knee = [0, 1].map((i) => (p.sit && view === 'f' ? ([legX[i] + (i ? 1.6 : -1.6), 75.5] as [number, number]) : null));
   const foot = [0, 1].map((i) => {
-    if (p.sit) return (view === 'f' ? [legX[i] + 11, 91] : [legX[i] + 1, 88]) as [number, number];
+    if (p.sit) return (view === 'f' ? [legX[i] + (i ? 2.6 : -2.6), 90] : [legX[i] + 1, 88]) as [number, number];
     return [legX[i] + p.swing[i] * 2.2, 91 - p.lift[i] * 4.5] as [number, number];
   }) as Geo['foot'];
   const sh: Geo['sh'] = [[24.5, 48 - p.bob], [47.5, 48 - p.bob]];
   const hand = [0, 1].map((i) => {
     const a = p.arm[i];
+    if (p.sit) return [legX[i] + (i ? 4.2 : -4.2), 72.5 - p.bob * 0.3] as [number, number]; // руки лежат на коленях
     let hx = sh[i][0] + (i ? 3.5 : -3.5) + Math.sin(a) * 3;
     let hy = sh[i][1] + 20 * Math.cos(a) - Math.sin(a) * 2;
     if (i === 1 && p.raise > 0) {
@@ -178,8 +182,6 @@ function drawBody(c: CanvasRenderingContext2D, g: Geo, look: Look, view: View): 
   for (const dx of [-15, 15]) { ell(c, hx + dx, hy + 2.4, 3.3, 4.4); fillStroke(c, shade(skin, -0.03), 1.1); ell(c, hx + dx * 0.97, hy + 2.6, 1.2, 2, 0); c.fillStyle = rgba(dark, 0.35); c.fill(); }
   ell(c, hx, hy, 15, 14.5); fillStroke(c, skin);
   if (view === 'f') {
-    // румянец
-    for (const dx of [-9.4, 9.4]) { ell(c, hx + dx, hy + 8.4, 3.6, 2.2); c.fillStyle = 'rgba(255,105,120,0.3)'; c.fill(); }
     for (const dx of [-6, 6]) {
       const ex = hx + dx, ey = hy + 3.4;
       ell(c, ex, ey, 3.3, 3.9); c.fillStyle = '#ffffff'; c.fill();
@@ -190,16 +192,65 @@ function drawBody(c: CanvasRenderingContext2D, g: Geo, look: Look, view: View): 
       c.strokeStyle = '#2a1a22'; c.lineWidth = 1.5; c.lineCap = 'round'; c.stroke();
       line(c, [[ex + (dx > 0 ? 3.2 : -3.2), ey - 1.6], [ex + (dx > 0 ? 4.6 : -4.6), ey - 2.6]], '#2a1a22', 1.1, 0.9);
       // бровь
-      c.beginPath(); c.moveTo(ex - 3.6, hy - 2.4); c.quadraticCurveTo(ex, hy - 4.6, ex + 3.6, hy - 2.6);
-      c.strokeStyle = rgba(shade(look.hairColor, -0.1), 0.9); c.lineWidth = 1.5; c.lineCap = 'round'; c.stroke();
+      c.beginPath();
+      if (look.brows === 'thick') { c.moveTo(ex - 4.2, hy - 1.6); c.quadraticCurveTo(ex, hy - 3.9, ex + 4.2, hy - 2.0); }
+      else { c.moveTo(ex - 3.6, hy - 2.4); c.quadraticCurveTo(ex, hy - 4.6, ex + 3.6, hy - 2.6); }
+      c.strokeStyle = rgba(shade(look.hairColor, look.brows === 'thick' ? -0.05 : -0.1), 0.92); c.lineWidth = look.brows === 'thick' ? 1.9 : 1.4; c.lineCap = 'round'; c.stroke();
     }
     // нос и рот
     c.beginPath(); c.moveTo(hx - 1, hy + 8.6); c.quadraticCurveTo(hx, hy + 9.8, hx + 1.2, hy + 8.8);
     c.strokeStyle = rgba(dark, 0.7); c.lineWidth = 1; c.stroke();
-    c.beginPath(); c.moveTo(hx - 3.2, hy + 11.7); c.quadraticCurveTo(hx, hy + 14.4, hx + 3.2, hy + 11.7);
-    c.strokeStyle = '#a94858'; c.lineWidth = 1.5; c.stroke();
-    line(c, [[hx - 1.2, hy + 13.1], [hx + 1.2, hy + 13.1]], '#ffffff', 0.8, 0.5);
+    drawMouth(c, hx, hy);
   }
+}
+
+function drawMouth(c: CanvasRenderingContext2D, hx: number, hy: number): void {
+  c.beginPath(); c.moveTo(hx - 3.2, hy + 11.7); c.quadraticCurveTo(hx, hy + 14.4, hx + 3.2, hy + 11.7);
+  c.strokeStyle = '#9a4a52'; c.lineWidth = 1.4; c.lineCap = 'round'; c.stroke();
+  line(c, [[hx - 1.2, hy + 13.1], [hx + 1.2, hy + 13.1]], '#ffffff', 0.8, 0.5);
+}
+
+/** Борода и щетина: рисуются поверх лица (вид спереди), рот перерисовывается сверху. */
+function drawBeard(c: CanvasRenderingContext2D, g: Geo, look: Look, view: View): void {
+  if (look.beard === 'none' || view === 'b') return;
+  const [hx, hy] = g.head;
+  const k = look.hairColor;
+  const x = (v: number) => hx - 36 + v, y = (v: number) => hy - 26 + v;
+  const path = () => {
+    c.beginPath();
+    c.moveTo(x(21.9), y(28.5));
+    c.bezierCurveTo(x(21.8), y(34.5), x(24.6), y(39.2), x(30), y(40.8));
+    c.bezierCurveTo(x(33.5), y(41.7), x(38.5), y(41.7), x(42), y(40.8));
+    c.bezierCurveTo(x(47.4), y(39.2), x(50.2), y(34.5), x(50.1), y(28.5));
+    c.lineTo(x(48.5), y(29.5));
+    c.bezierCurveTo(x(48.6), y(33.5), x(46.8), y(36.2), x(43.5), y(36.2));
+    c.bezierCurveTo(x(41), y(36), x(39), y(34.4), x(36), y(34.4));
+    c.bezierCurveTo(x(33), y(34.4), x(31), y(36), x(28.5), y(36.2));
+    c.bezierCurveTo(x(25.2), y(36.2), x(23.4), y(33.5), x(23.5), y(29.5));
+    c.closePath();
+  };
+  c.save();
+  path(); c.clip();
+  if (look.beard === 'stubble') {
+    // ухоженная щетина: ровная мягкая тень, плотнее у подбородка, лёгкая мелкая фактура
+    const sg = c.createLinearGradient(0, y(30), 0, y(41.6));
+    sg.addColorStop(0, rgba(shade(k, 0.3), 0.3));
+    sg.addColorStop(0.55, rgba(shade(k, 0.22), 0.44));
+    sg.addColorStop(1, rgba(shade(k, 0.12), 0.58));
+    c.fillStyle = sg; c.fillRect(0, 0, CHAR_W, CHAR_H);
+    let seed = 91;
+    const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+    for (let i = 0; i < 70; i++) {
+      c.fillStyle = rgba(shade(k, 0.1), 0.1 + rnd() * 0.1);
+      c.beginPath(); c.arc(x(22 + rnd() * 28), y(30 + rnd() * 11), 0.2 + rnd() * 0.12, 0, Math.PI * 2); c.fill();
+    }
+  } else {
+    c.fillStyle = lg(c, k); c.fillRect(0, 0, CHAR_W, CHAR_H);
+    for (let i = 0; i < 9; i++) line(c, [[x(24 + i * 3.1), y(33)], [x(25 + i * 3 + (i - 4) * 0.4), y(41.4)]], shade(k, 0.4), 0.8, 0.35);
+  }
+  c.restore();
+  if (look.beard === 'full') { path(); c.strokeStyle = rgba(shade(k, -0.6), 0.75); c.lineWidth = 1.1; c.lineJoin = 'round'; c.stroke(); }
+  drawMouth(c, hx, hy);
 }
 
 function drawBottom(c: CanvasRenderingContext2D, g: Geo, look: Look): void {
@@ -246,8 +297,61 @@ function drawShoes(c: CanvasRenderingContext2D, g: Geo, look: Look): void {
   }
 }
 
+/** Рисунок вертикальной полоски для рубашки. */
+function stripes(c: CanvasRenderingContext2D, color: string): CanvasPattern | string {
+  const cv = document.createElement('canvas');
+  cv.width = 24; cv.height = 24;
+  const k = cv.getContext('2d')!;
+  k.fillStyle = color; k.fillRect(0, 0, 24, 24);
+  k.fillStyle = 'rgba(255,255,255,0.78)'; k.fillRect(7, 0, 3, 24);
+  k.fillStyle = 'rgba(255,255,255,0.45)'; k.fillRect(17, 0, 1.6, 24);
+  const pat = c.createPattern(cv, 'repeat');
+  if (!pat) return color;
+  pat.setTransform(new DOMMatrix().scale(0.3));
+  return pat;
+}
+
+function drawShirt(c: CanvasRenderingContext2D, g: Geo, color: string, view: View): void {
+  const b = g.bob;
+  const st = stripes(c, color);
+  const edge = rgba(shade(color, -0.66), 0.78);
+  const light = () => { const gr = c.createLinearGradient(14, 0, 58, 0); gr.addColorStop(0, 'rgba(255,255,255,0.2)'); gr.addColorStop(0.5, 'rgba(255,255,255,0)'); gr.addColorStop(1, 'rgba(0,0,40,0.26)'); return gr; };
+  const sleeve = (i: number) => {
+    const [sx, sy] = g.sh[i]; const [hx, hy] = g.hand[i];
+    const ex = sx + (hx - sx) * 0.62, ey = sy + (hy - sy) * 0.62;
+    c.lineCap = 'round';
+    c.beginPath(); c.moveTo(sx, sy); c.lineTo(ex, ey); c.strokeStyle = edge; c.lineWidth = 5.6 * 2 + 2.4; c.stroke();
+    c.strokeStyle = st; c.lineWidth = 5.6 * 2; c.stroke();
+    c.strokeStyle = light(); c.stroke();
+  };
+  sleeve(0); sleeve(1);
+  const panel = (pts: [number, number][]) => {
+    c.beginPath(); pts.forEach(([px, py], k) => (k ? c.lineTo(px, py) : c.moveTo(px, py))); c.closePath();
+    c.fillStyle = st; c.fill(); c.fillStyle = light(); c.fill();
+    c.strokeStyle = edge; c.lineWidth = 1.3; c.lineJoin = 'round'; c.stroke();
+  };
+  if (view === 'b') {
+    rrect(c, 23, 44 - b, 26, 29 + b, 7.5); c.fillStyle = st; c.fill(); c.fillStyle = light(); c.fill(); c.strokeStyle = edge; c.lineWidth = 1.3; c.stroke();
+    rrect(c, 27, 41.5 - b, 18, 5, 2.5); c.fillStyle = shade(color, -0.12); c.fill(); c.strokeStyle = edge; c.lineWidth = 1.1; c.stroke();
+    return;
+  }
+  // белая футболка в просвете рубашки
+  rrect(c, 28, 44 - b, 16, 28 + b, 5); fillStroke(c, '#f6f6f8', 1.2);
+  c.beginPath(); c.ellipse(36, 44 - b, 6.6, 4, 0, 0, Math.PI); c.strokeStyle = 'rgba(70,70,90,0.55)'; c.lineWidth = 1.3; c.stroke();
+  // полы рубашки
+  panel([[23.6, 47 - b], [24.5, 44 - b], [31.6, 44 - b], [30.4, 73], [23.6, 73]]);
+  panel([[48.4, 47 - b], [47.5, 44 - b], [40.4, 44 - b], [41.6, 73], [48.4, 73]]);
+  // воротник
+  const collar = (m: number) => { c.beginPath(); c.moveTo(36 + m * 5.4, 42.6 - b); c.lineTo(36 + m * 10.2, 44.4 - b); c.lineTo(36 + m * 4.4, 53.6 - b); c.lineTo(36 + m * 2.6, 46.4 - b); c.closePath(); c.fillStyle = shade(color, 0.12); c.fill(); c.strokeStyle = edge; c.lineWidth = 1.2; c.lineJoin = 'round'; c.stroke(); };
+  collar(-1); collar(1);
+  // пуговицы и карман
+  for (const yy of [57, 64]) { ell(c, 40.9, yy, 0.9, 0.9); c.fillStyle = '#f3f6ff'; c.fill(); }
+  rrect(c, 25.4, 58 - b * 0.3, 4.4, 5, 0.8); c.strokeStyle = edge; c.lineWidth = 0.9; c.stroke();
+}
+
 function drawTop(c: CanvasRenderingContext2D, g: Geo, look: Look, view: View): void {
   const { style, color } = look.top;
+  if (style === 'shirt') { drawShirt(c, g, color, view); return; }
   const b = g.bob;
   const dark = shade(color, -0.3);
   const long = style !== 'tee';
@@ -296,6 +400,11 @@ function drawHairBack(c: CanvasRenderingContext2D, g: Geo, look: Look, view: Vie
 }
 
 function drawHairFront(c: CanvasRenderingContext2D, g: Geo, look: Look, view: View): void {
+  if (look.hairStyle === 'bald') {
+    const [bx, by] = g.head;
+    ell(c, bx - 4.5, by - 9, 6.6, 3.2, -0.3); c.fillStyle = 'rgba(255,255,255,0.26)'; c.fill();
+    return;
+  }
   const img = hairImage(look.hairStyle, look.hairColor, view === 'f' ? 'over' : 'back');
   if (img) c.drawImage(img, 0, -TOP - g.bob, CHAR_W, CHAR_H);
 }
@@ -324,6 +433,17 @@ function drawAccessory(c: CanvasRenderingContext2D, g: Geo, look: Look, view: Vi
       rrect(c, hx + dx, hy - 5.6, 7, 15, 3.4); fillStroke(c, '#e9506a', 1.2);
       rrect(c, hx + dx + 1.2, hy - 3, 4.6, 10, 2.2); c.fillStyle = rgba(shade('#e9506a', 0.45), 0.6); c.fill();
     }
+  } else if (style === 'chain') {
+    if (view === 'f') {
+      c.beginPath(); c.moveTo(30.2, 41.4 - b); c.quadraticCurveTo(36, 56 - b, 41.8, 41.4 - b);
+      c.setLineDash([1.7, 0.9]); c.lineCap = 'butt';
+      c.strokeStyle = 'rgba(40,50,70,0.75)'; c.lineWidth = 2.1; c.stroke();
+      c.strokeStyle = '#e9eef6'; c.lineWidth = 1.3; c.stroke();
+      c.setLineDash([]); c.lineCap = 'round';
+    } else {
+      c.beginPath(); c.moveTo(30.4, 42.6 - b); c.quadraticCurveTo(36, 45 - b, 41.6, 42.6 - b);
+      c.strokeStyle = '#e9eef6'; c.lineWidth = 1.2; c.stroke();
+    }
   } else if (style === 'scarf') {
     rrect(c, 24.6, 40 - b, 22.8, 10, 5); fillStroke(c, color);
     line(c, [[28, 43 - b], [44, 46 - b]], shade(color, -0.4), 1, 0.45);
@@ -335,7 +455,7 @@ function drawAccessory(c: CanvasRenderingContext2D, g: Geo, look: Look, view: Vi
 }
 
 const DRAW: Record<Layer, (c: CanvasRenderingContext2D, g: Geo, look: Look, view: View) => void> = {
-  hairBack: drawHairBack, body: drawBody, bottom: (c, g, l) => drawBottom(c, g, l), shoes: (c, g, l) => drawShoes(c, g, l),
+  hairBack: drawHairBack, body: drawBody, beard: drawBeard, bottom: (c, g, l) => drawBottom(c, g, l), shoes: (c, g, l) => drawShoes(c, g, l),
   top: drawTop, hairFront: drawHairFront, accessory: drawAccessory,
 };
 

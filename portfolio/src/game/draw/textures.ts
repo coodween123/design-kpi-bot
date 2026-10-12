@@ -29,7 +29,7 @@ export function makeFurnitureTexture(scene: Phaser.Scene, def: FurnitureDef): Fu
 }
 
 /** Светящийся контур предмета (для подсветки при наведении): силуэт, расширенный на r px, залитый цветом. */
-export function makeOutlineTexture(scene: Phaser.Scene, srcKey: string, outKey: string, r = 3): void {
+export function makeOutlineTexture(scene: Phaser.Scene, srcKey: string, outKey: string, r = 2): void {
   if (scene.textures.exists(outKey)) return;
   const src = scene.textures.get(srcKey).getSourceImage() as HTMLCanvasElement;
   const S = SETTINGS.texScale;
@@ -39,7 +39,7 @@ export function makeOutlineTexture(scene: Phaser.Scene, srcKey: string, outKey: 
   const rr = r * S;
   for (let a = 0; a < 16; a++) c.drawImage(src, Math.cos((a / 16) * Math.PI * 2) * rr, Math.sin((a / 16) * Math.PI * 2) * rr);
   c.globalCompositeOperation = 'source-in';
-  c.fillStyle = '#fff4a8';
+  c.fillStyle = '#eaf6ff';
   c.fillRect(0, 0, cv.width, cv.height);
   scene.textures.addCanvas(outKey, cv);
 }

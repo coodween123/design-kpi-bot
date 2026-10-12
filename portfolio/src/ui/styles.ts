@@ -38,7 +38,7 @@ button{cursor:pointer}
   text-shadow:0 1px 2px rgba(0,40,80,.7);transition:transform .08s,filter .15s;white-space:nowrap}
 .btn:hover{filter:brightness(1.1)}
 .btn:active{transform:translateY(2px);box-shadow:0 0 0 #0f4d80,inset 0 1px 0 rgba(255,255,255,.4)}
-.btn.orange{background:${GLOSS_OR};border-color:#ffe39a;box-shadow:0 2px 0 #9a560a,0 4px 8px rgba(40,20,0,.35),inset 0 1px 0 rgba(255,255,255,.65);text-shadow:0 1px 2px rgba(120,60,0,.7)}
+.btn.orange{background:${GLOSS_OR};border-color:#ffe39a;box-shadow:0 2px 0 #9a560a,0 4px 8px rgba(40,20,0,.35),inset 0 1px 0 rgba(255,255,255,.65);color:#4a2700;text-shadow:0 1px 0 rgba(255,255,255,.5)}
 .btn.dark{background:${GLOSS_DK};border-color:#6fb4e3}
 .btn.icon{padding:0;width:42px}
 .btn:focus-visible,.cat:focus-visible,.cell:focus-visible,.sv-card:focus-visible,.close:focus-visible,.menu a:focus-visible,a:focus-visible{outline:3px solid #ffe066;outline-offset:2px}
@@ -49,9 +49,6 @@ button{cursor:pointer}
   box-shadow:0 3px 8px rgba(0,20,40,.4);pointer-events:none;opacity:0;transition:opacity .12s;white-space:nowrap}
 .tip::after{content:'';position:absolute;left:50%;bottom:-6px;width:10px;height:10px;background:#fff3a8;border-right:1px solid #cdb64d;border-bottom:1px solid #cdb64d;transform:translateX(-50%) rotate(45deg)}
 .tip.on{opacity:1}
-.status{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);padding:8px 18px;border:1px solid #a5defe;border-radius:999px;background:${GLOSS};box-shadow:0 2px 0 #0f4d80,0 4px 10px rgba(0,25,50,.4);
-  font-weight:800;opacity:0;transition:opacity .2s;pointer-events:none;white-space:nowrap;text-shadow:0 1px 2px rgba(0,40,80,.7)}
-.status.on{opacity:1}
 .toast{position:absolute;left:50%;top:70px;transform:translate(-50%,-8px);max-width:calc(100% - 28px);padding:9px 18px;border:1px solid #a5defe;border-radius:12px;background:${GLOSS_DK};box-shadow:0 4px 12px rgba(0,25,50,.5);
   font-weight:800;text-align:center;opacity:0;transition:.25s;pointer-events:none;text-shadow:0 1px 2px rgba(0,40,80,.7)}
 .toast.on{opacity:1;transform:translate(-50%,0)}
@@ -90,7 +87,7 @@ button{cursor:pointer}
 .portrait{position:relative;border-radius:10px;padding:8px 8px 52px;background:linear-gradient(#f4ecbc,#dcc979);border:3px solid #eea92c;box-shadow:inset 0 0 0 2px rgba(255,255,255,.55),0 3px 0 #8a5a12,0 6px 12px rgba(0,20,40,.35);text-align:center}
 .portrait canvas{display:block;width:100%;max-width:150px;height:auto;margin:0 auto}
 .ribbon{position:absolute;left:6px;right:6px;bottom:6px;padding:6px 8px;border:1px solid #ffe39a;border-radius:8px;background:${GLOSS_OR};box-shadow:0 2px 0 #9a560a;
-  font-weight:900;font-size:13px;line-height:1.15;color:#fff;text-shadow:0 1px 2px rgba(120,60,0,.75)}
+  font-weight:900;font-size:13px;line-height:1.15;color:#4a2700;text-shadow:0 1px 0 rgba(255,255,255,.5)}
 .name{display:flex;align-items:center;gap:8px}
 .star{position:relative;flex:none;width:60px;height:60px;display:grid;place-items:center;filter:drop-shadow(0 2px 2px rgba(0,30,60,.5))}
 .star svg{position:absolute;inset:0;width:100%;height:100%}
@@ -142,6 +139,7 @@ button{cursor:pointer}
 .wd{display:grid;grid-template-columns:150px 118px minmax(0,1fr);gap:10px;min-height:0;flex:1;padding:12px;overflow:hidden}
 .wd .portrait{align-self:start;padding-bottom:10px}
 .wd .col{min-height:0;display:flex;flex-direction:column;gap:6px;overflow:auto}
+.cat.preset,.preset{margin-top:6px;min-height:40px;padding:0 10px;font-size:13px}
 .cat{min-height:40px;padding:0 10px;border:1px solid #6fb4e3;border-radius:9px;background:${GLOSS_DK};box-shadow:0 2px 0 #0f4d80,inset 0 1px 0 rgba(255,255,255,.35);font-weight:800;font-size:13.5px;text-align:left;text-shadow:0 1px 1px rgba(0,40,80,.7);color:#fff}
 .cat[aria-selected=true]{background:${GLOSS};border-color:#c6ecff;box-shadow:0 2px 0 #0f4d80,0 0 0 2px #ffe066,inset 0 1px 0 rgba(255,255,255,.6)}
 .cells{min-height:0;overflow:auto;padding:10px;border-radius:10px;background:#eef3f6;box-shadow:inset 0 2px 6px rgba(0,30,60,.25);display:grid;grid-template-columns:repeat(auto-fill,minmax(82px,1fr));gap:8px;align-content:start}

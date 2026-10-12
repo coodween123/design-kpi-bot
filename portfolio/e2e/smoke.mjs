@@ -34,6 +34,7 @@ const closeWin = async () => { await p.locator('.win .close').click(); await p.w
 const hudText = await p.locator('.actions').innerText();
 ok(!/Гардероб|Подсказка/.test(hudText) && (await p.locator('.brand').count()) === 0, 'сверху нет кнопок «Гардероб», «Подсказка» и надписи «Портфолио»');
 ok(/Меню/.test(hudText), 'сверху есть «Меню»');
+ok(await p.locator('.status').count() === 0, 'внизу нет подсказки «Иду к…»');
 await p.waitForTimeout(1500);
 
 // 1. Ход по полу
@@ -74,6 +75,9 @@ ok(about.includes('Георгий Андюл') && about.includes('Графиче
 ok(/около пяти лет/i.test(about), 'в «Обо мне»: около пяти лет');
 ok(about.includes('Вместе Медиа') && about.includes('2024') && about.includes('Лучший брендинг'), 'в «Обо мне»: конкурс «Вместе Медиа», 2024, «Лучший брендинг»');
 ok(about.includes('X5 Group') && about.includes('Перекрёстком') && about.includes('Островком') && about.includes('Smartfon'), 'в «Обо мне»: компании как в ТЗ');
+ok((await p.locator('.win .portrait canvas').count()) === 1, 'в «Обо мне» есть портрет персонажа');
+const orangeColor = await p.locator('.win a.btn.orange').evaluate((e) => getComputedStyle(e).color);
+ok(orangeColor !== 'rgb(255, 255, 255)', `текст на оранжевой кнопке не белый: ${orangeColor}`);
 await p.screenshot({ path: `${OUT}/about.png` });
 await closeWin();
 
@@ -132,9 +136,9 @@ await p.waitForSelector('.win.panel', { timeout: 15000 });
 ok((await title()) === 'Гардероб', 'шкаф открыл гардероб');
 await p.getByRole('tab', { name: 'Причёска' }).click();
 const hairNames = await p.locator('.cell').allInnerTexts();
-ok(hairNames.length === 7, `в гардеробе 7 причёсок: ${hairNames.join(', ')}`);
+ok(hairNames.length === 8, `в гардеробе 8 вариантов причёсок: ${hairNames.join(', ')}`);
 const thumbs = await p.locator('.cell canvas').count();
-ok(thumbs === 7, 'у причёсок графические миниатюры (canvas), а не фигуры');
+ok(thumbs === 8, 'у причёсок графические миниатюры (canvas), а не фигуры');
 await p.getByRole('radio', { name: 'Кудри' }).click();
 await p.getByRole('tab', { name: 'Верх' }).click();
 await p.getByRole('radio', { name: 'Куртка, синяя' }).click();
@@ -159,6 +163,19 @@ await p.waitForTimeout(1200);
 await p.screenshot({ path: `${OUT}/after-confirm.png` });
 ok(true, 'после гардероба мир продолжает работать (персонаж идёт)');
 await waitIdle();
+
+// 9б. «Образ Георгия» из гардероба: всё собирается из каталога
+await clickObj('wardrobe');
+await p.waitForSelector('.win.panel', { timeout: 15000 });
+const cats = await p.locator('.cat').allInnerTexts();
+ok(['Брови', 'Борода'].every((c) => cats.includes(c)), `в гардеробе есть категории бровей и бороды: ${cats.join(', ')}`);
+await p.getByRole('button', { name: 'Применить образ Георгия' }).click();
+await p.waitForTimeout(500);
+await p.getByRole('button', { name: 'Подтвердить' }).click();
+const g = JSON.parse(await p.evaluate(() => localStorage.getItem('avatar-portfolio:appearance:v1')));
+ok(g.hairStyle === 'bald' && g.beard === 'stubble' && g.brows === 'thick' && g.top === 'shirt-blue' && g.accessory === 'chain', 'образ Георгия применяется и сохраняется');
+await p.screenshot({ path: `${OUT}/georgy.png` });
+await p.waitForTimeout(700);
 
 // 10. Адреса и меню
 await p.goto(URL_ + '#/services');

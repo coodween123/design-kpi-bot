@@ -216,8 +216,8 @@ export class RoomScene extends Phaser.Scene {
   private setLit(o: Obj, on: boolean): void {
     if (!o.outline) return;
     this.tweens.killTweensOf([o.outline, o.glow]);
-    this.tweens.add({ targets: o.outline, alpha: on ? 1 : 0, duration: 140 });
-    this.tweens.add({ targets: o.glow, alpha: on ? 0.2 : 0, duration: 140 });
+    this.tweens.add({ targets: o.outline, alpha: on ? 0.55 : 0, duration: 180 });
+    this.tweens.add({ targets: o.glow, alpha: on ? 0.06 : 0, duration: 180 });
   }
 
   /** Один раз при старте коротко подсвечивает все интерактивные предметы — чтобы было видно, на что можно нажать. */
@@ -225,7 +225,7 @@ export class RoomScene extends Phaser.Scene {
     let i = 0;
     for (const o of this.objs.values()) {
       if (!o.outline) continue;
-      this.tweens.add({ targets: o.outline, alpha: 1, duration: 260, yoyo: true, hold: 220, delay: 700 + i++ * 140, ease: 'Sine.easeInOut' });
+      this.tweens.add({ targets: o.outline, alpha: 0.5, duration: 320, yoyo: true, hold: 200, delay: 700 + i++ * 140, ease: 'Sine.easeInOut' });
     }
   }
 

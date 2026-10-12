@@ -3,9 +3,9 @@
 <div id="r"></div>
 <script type="module">
 import { renderCharacterPreview, preloadAppearance } from '../src/game/draw/character.ts';
-import { DEFAULT_APPEARANCE } from '../src/config/wardrobe.ts';
+import { DEFAULT_APPEARANCE, GEORGY_APPEARANCE } from '../src/config/wardrobe.ts';
 const variants = [
-  {}, { hairStyle: 'long', hairColor: 'hc-blond', top: 'tee-coral', bottom: 'skirt-plum', shoes: 'boots-brown', skin: 'skin-1', accessory: 'glasses' },
+  GEORGY_APPEARANCE, {}, { hairStyle: 'long', hairColor: 'hc-blond', top: 'tee-coral', bottom: 'skirt-plum', shoes: 'boots-brown', skin: 'skin-1', accessory: 'glasses' },
   { hairStyle: 'spiky', hairColor: 'hc-blue', top: 'jacket-navy', bottom: 'pants-black', skin: 'skin-4', accessory: 'headphones' },
   { hairStyle: 'curly', hairColor: 'hc-red', top: 'tee-mint', bottom: 'shorts-sand', shoes: 'sneakers-red', skin: 'skin-5', accessory: 'scarf' },
   { hairStyle: 'bun', hairColor: 'hc-pink', top: 'hoodie-gray', accessory: 'cap' }, { hairStyle: 'ponytail', hairColor: 'hc-black', top: 'jacket-mustard', skin: 'skin-3' },

@@ -3,7 +3,7 @@ import type { ActionDef } from '../config/room';
 import {
   ABOUT, CTA_DISCUSS, CTA_OFFER, CTA_PRICE, PRICE_NOTE, PROJECTS, SECTIONS, SERVICES, Service, TELEGRAM_URL,
 } from '../config/sections';
-import { Appearance, CategoryId, DEFAULT_APPEARANCE, WARDROBE, WardrobeCategory, WardrobeItem } from '../config/wardrobe';
+import { Appearance, CategoryId, DEFAULT_APPEARANCE, GEORGY_APPEARANCE, WARDROBE, WardrobeCategory, WardrobeItem } from '../config/wardrobe';
 import { preloadAppearance, renderCharacterCrop, renderCharacterPreview } from '../game/draw/character';
 import { HAIR_STYLES, preloadHair } from '../game/draw/hair';
 import { findItem } from '../config/wardrobe';
@@ -46,7 +46,6 @@ export class UI {
   private hud: HTMLElement;
   private tip: HTMLElement;
   private toastEl: HTMLElement;
-  private statusEl: HTMLElement;
   private loader: HTMLElement;
   private bar: HTMLElement;
   private menu: HTMLElement | null = null;
@@ -76,8 +75,6 @@ export class UI {
     this.tip = el('div', 'tip');
     this.toastEl = el('div', 'toast');
     this.toastEl.setAttribute('role', 'status');
-    this.statusEl = el('div', 'status');
-    this.statusEl.setAttribute('aria-live', 'polite');
     this.loader = el('div', 'loader', `<div><b>Загрузка…</b><div class="bar"><i></i></div></div>`);
     this.bar = this.loader.querySelector('i')!;
 
@@ -93,7 +90,7 @@ export class UI {
       fs.addEventListener('click', () => { if (document.fullscreenElement) void document.exitFullscreen(); else void host.requestFullscreen?.(); });
       actions.append(fs);
     }
-    this.hud.append(actions, this.tip, this.toastEl, this.statusEl);
+    this.hud.append(actions, this.tip, this.toastEl);
     this.root.append(this.stage, this.hud, this.loader);
 
     this.wireBus();
@@ -119,10 +116,6 @@ export class UI {
     this.bus.on('hover', ({ label, x, y }) => {
       this.tip.classList.toggle('on', !!label && !this.win);
       if (label) { this.tip.textContent = label; this.tip.style.left = `${x}px`; this.tip.style.top = `${y}px`; }
-    });
-    this.bus.on('selected', (s) => {
-      this.statusEl.textContent = s ? `Иду: ${s.label}` : '';
-      this.statusEl.classList.toggle('on', !!s);
     });
     this.bus.on('toast', (t) => this.toast(t));
     this.bus.on('action', ({ action }) => this.runAction(action));
@@ -313,7 +306,7 @@ export class UI {
     const cv = el('canvas');
     portrait.append(cv, el('div', 'ribbon', ''));
     (portrait.querySelector('.ribbon') as HTMLElement).textContent = ABOUT.role;
-    void this.paintPortrait(cv, this.committed);
+    void this.paintPortrait(cv, GEORGY_APPEARANCE);
 
     const right = el('div');
     const name = el('div', 'name', `<div class="star"><svg viewBox="0 0 54 54"><defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8fd6ff"/><stop offset="1" stop-color="#2a82c0"/></linearGradient></defs><path d="M27 3l7.400 15.200 16.600 2.400-12 11.800 2.800 16.600L27 40.900 12.200 49l2.800-16.600-12-11.800 16.600-2.400z" fill="url(#sg)" stroke="#0d3a5f" stroke-width="2" stroke-linejoin="round"/></svg><b></b></div><div class="namebar"></div>`);
@@ -450,6 +443,15 @@ export class UI {
     const cats = el('div', 'col'); cats.setAttribute('role', 'tablist'); cats.setAttribute('aria-label', 'Категории');
     const cells = el('div', 'cells'); cells.setAttribute('role', 'radiogroup');
     const left = el('div', 'col'); left.append(cats);
+    const preset = el('button', 'btn orange preset', `${ICONS.user}<span>Образ Георгия</span>`);
+    preset.setAttribute('aria-label', 'Применить образ Георгия');
+    preset.addEventListener('click', () => {
+      this.working = { ...GEORGY_APPEARANCE };
+      this.bus.emit('preview', { ...this.working });
+      void repaintPortrait(); void renderCells(true);
+      renderCats();
+    });
+    left.append(preset);
     wd.append(portrait, left, cells);
     w.append(wd);
 
@@ -547,6 +549,6 @@ export class UI {
 /** Области миниатюр на холсте персонажа (x, y, ширина, высота). */
 const CROPS: Record<CategoryId, [number, number, number, number]> = {
   skin: [0, 0, 1, 1], hairColor: [0, 0, 1, 1],
-  hairStyle: [10, 0, 52, 64], accessory: [10, 0, 52, 66],
+  hairStyle: [10, 0, 52, 64], accessory: [10, 0, 52, 66], brows: [10, 0, 52, 64], beard: [10, 0, 52, 64],
   top: [8, 44, 56, 46], bottom: [12, 70, 48, 34], shoes: [14, 90, 44, 20],
 };

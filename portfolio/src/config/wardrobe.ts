@@ -1,6 +1,6 @@
 // Каталог гардероба. Чтобы добавить вариант — допишите элемент в нужную категорию.
 // style — ключ рисовалки в game/draw/character.ts, color — основной цвет элемента.
-export type CategoryId = 'skin' | 'hairStyle' | 'hairColor' | 'top' | 'bottom' | 'shoes' | 'accessory';
+export type CategoryId = 'skin' | 'hairStyle' | 'hairColor' | 'brows' | 'beard' | 'top' | 'bottom' | 'shoes' | 'accessory';
 
 export interface WardrobeItem {
   id: string;
@@ -22,6 +22,7 @@ export const WARDROBE: WardrobeCategory[] = [
     id: 'skin', label: 'Кожа', kind: 'color',
     items: [
       { id: 'skin-1', label: 'Светлая', color: '#ffdcc2' },
+      { id: 'skin-6', label: 'Светлая тёплая', color: '#eec4a6' },
       { id: 'skin-2', label: 'Тёплая', color: '#f3c19b' },
       { id: 'skin-3', label: 'Смуглая', color: '#d29566' },
       { id: 'skin-4', label: 'Бронзовая', color: '#a8693f' },
@@ -31,6 +32,7 @@ export const WARDROBE: WardrobeCategory[] = [
   {
     id: 'hairStyle', label: 'Причёска', kind: 'style',
     items: [
+      { id: 'bald', label: 'Без волос', style: 'bald' },
       { id: 'short', label: 'Короткая', style: 'short' },
       { id: 'bob', label: 'Каре', style: 'bob' },
       { id: 'long', label: 'Длинные', style: 'long' },
@@ -41,7 +43,7 @@ export const WARDROBE: WardrobeCategory[] = [
     ],
   },
   {
-    id: 'hairColor', label: 'Цвет волос', kind: 'color',
+    id: 'hairColor', label: 'Цвет волос и бороды', kind: 'color',
     items: [
       { id: 'hc-black', label: 'Чёрный', color: '#2b2230' },
       { id: 'hc-brown', label: 'Каштановый', color: '#6a4330' },
@@ -49,6 +51,21 @@ export const WARDROBE: WardrobeCategory[] = [
       { id: 'hc-red', label: 'Рыжий', color: '#c55a2b' },
       { id: 'hc-pink', label: 'Розовый', color: '#e06fa5' },
       { id: 'hc-blue', label: 'Голубой', color: '#4aa3df' },
+    ],
+  },
+  {
+    id: 'brows', label: 'Брови', kind: 'style',
+    items: [
+      { id: 'normal', label: 'Обычные', style: 'normal' },
+      { id: 'thick', label: 'Густые', style: 'thick' },
+    ],
+  },
+  {
+    id: 'beard', label: 'Борода', kind: 'style',
+    items: [
+      { id: 'none', label: 'Без бороды', style: 'none' },
+      { id: 'stubble', label: 'Щетина', style: 'stubble' },
+      { id: 'full', label: 'Борода', style: 'full' },
     ],
   },
   {
@@ -60,6 +77,8 @@ export const WARDROBE: WardrobeCategory[] = [
       { id: 'hoodie-gray', label: 'Худи, серое', style: 'hoodie', color: '#7d8795' },
       { id: 'jacket-navy', label: 'Куртка, синяя', style: 'jacket', color: '#2f4a7a' },
       { id: 'jacket-mustard', label: 'Куртка, горчица', style: 'jacket', color: '#d9a43a' },
+      { id: 'shirt-blue', label: 'Рубашка в полоску, голубая', style: 'shirt', color: '#86a7ef' },
+      { id: 'shirt-sand', label: 'Рубашка в полоску, песочная', style: 'shirt', color: '#d8b98a' },
     ],
   },
   {
@@ -87,6 +106,7 @@ export const WARDROBE: WardrobeCategory[] = [
       { id: 'cap', label: 'Кепка', style: 'cap', color: '#e0524c' },
       { id: 'headphones', label: 'Наушники', style: 'headphones', color: '#2b2230' },
       { id: 'scarf', label: 'Шарф', style: 'scarf', color: '#e8b13a' },
+      { id: 'chain', label: 'Цепочка', style: 'chain', color: '#d9dee6' },
     ],
   },
 ];
@@ -97,6 +117,8 @@ export const DEFAULT_APPEARANCE: Appearance = {
   skin: 'skin-2',
   hairStyle: 'short',
   hairColor: 'hc-brown',
+  brows: 'normal',
+  beard: 'none',
   top: 'hoodie-violet',
   bottom: 'jeans-blue',
   shoes: 'sneakers-white',
@@ -107,3 +129,16 @@ export function findItem(cat: CategoryId, id: string): WardrobeItem {
   const c = WARDROBE.find((x) => x.id === cat)!;
   return c.items.find((i) => i.id === id) ?? c.items[0];
 }
+
+/** Образ Георгия Андюла: используется в «Обо мне»; такого же персонажа можно собрать в гардеробе. */
+export const GEORGY_APPEARANCE: Appearance = {
+  skin: 'skin-6',
+  hairStyle: 'bald',
+  hairColor: 'hc-black',
+  brows: 'thick',
+  beard: 'stubble',
+  top: 'shirt-blue',
+  bottom: 'pants-black',
+  shoes: 'sneakers-white',
+  accessory: 'chain',
+};
