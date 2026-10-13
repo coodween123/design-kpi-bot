@@ -72,9 +72,9 @@ export const AWARD_ART: Record<'trophy' | 'brands' | 'years', string> = {
 };
 
 export const EMPTY_PROJECTS_ART = svg(220, 150, `
-  <rect x="40" y="18" width="140" height="92" rx="9" fill="#0c3f66" stroke="#8fd1fa" stroke-width="3"/>
+  <rect x="40" y="18" width="140" height="92" rx="9" fill="#f2f5fe" stroke="#509af9" stroke-width="3"/>
   <rect x="48" y="26" width="124" height="76" rx="4" fill="url(#s)"/>
   <rect x="62" y="40" width="46" height="34" rx="4" fill="#fff" opacity=".85"/><rect x="114" y="40" width="44" height="14" rx="3" fill="#fff" opacity=".6"/><rect x="114" y="60" width="30" height="14" rx="3" fill="#ffd166" opacity=".9"/>
   <rect x="62" y="82" width="96" height="6" rx="3" fill="#fff" opacity=".4"/>
-  <path d="M96 110h28l5 16H91z" fill="#0c3f66" stroke="#8fd1fa" stroke-width="3" stroke-linejoin="round"/><rect x="78" y="124" width="64" height="8" rx="4" fill="#0c3f66" stroke="#8fd1fa" stroke-width="3"/>`,
+  <path d="M96 110h28l5 16H91z" fill="#f2f5fe" stroke="#509af9" stroke-width="3" stroke-linejoin="round"/><rect x="78" y="124" width="64" height="8" rx="4" fill="#f2f5fe" stroke="#509af9" stroke-width="3"/>`,
   `<linearGradient id="s" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#4fb8f0"/><stop offset="1" stop-color="#3a6fd8"/></linearGradient>`);

@@ -309,15 +309,14 @@ export class UI {
     void this.paintPortrait(cv, GEORGY_APPEARANCE);
 
     const right = el('div');
-    const name = el('div', 'name', `<div class="star"><svg viewBox="0 0 54 54"><defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#8fd6ff"/><stop offset="1" stop-color="#2a82c0"/></linearGradient></defs><path d="M27 3l7.400 15.200 16.600 2.400-12 11.800 2.800 16.600L27 40.900 12.200 49l2.800-16.600-12-11.800 16.600-2.400z" fill="url(#sg)" stroke="#0d3a5f" stroke-width="2" stroke-linejoin="round"/></svg><b></b></div><div class="namebar"></div>`);
-    name.querySelector('b')!.textContent = ABOUT.yearsBadge;
-    name.querySelector('.namebar')!.textContent = ABOUT.name;
+    const nm = el('h3', 'nm');
+    nm.textContent = ABOUT.name;
     const yrs = el('p', 'yrs'); yrs.textContent = ABOUT.yearsLabel;
     const tags = el('div', 'tags');
     for (const t of ABOUT.tags) { const s = el('span', 'tag'); s.textContent = t; tags.append(s); }
     const text = el('div', 'pnl');
     for (const t of ABOUT.paragraphs) { const p = el('p'); p.textContent = t; text.append(p); }
-    right.append(name, yrs, tags, text);
+    right.append(nm, yrs, tags, text);
     wrap.append(portrait, right);
 
     const lbl = el('div', 'lbl'); lbl.textContent = 'Достижения';
@@ -518,7 +517,7 @@ export class UI {
     const bReset = el('button', 'btn dark grow', `${ICONS.reset}<span class="tx">Сбросить</span>`);
     bReset.setAttribute('aria-label', 'Сбросить к стандартному образу');
     const bCancel = el('button', 'btn dark', `<span>Отмена</span>`);
-    const bOk = el('button', 'btn orange', `${ICONS.check}<span>Подтвердить</span>`);
+    const bOk = el('button', 'btn', `${ICONS.check}<span>Подтвердить</span>`);
     bReset.addEventListener('click', () => {
       this.working = { ...DEFAULT_APPEARANCE };
       this.bus.emit('preview', { ...this.working });
