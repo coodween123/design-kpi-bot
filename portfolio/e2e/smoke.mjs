@@ -27,7 +27,7 @@ const clickObj = async (id) => { const pt = await posObj(id); await p.mouse.clic
 const clickPoint = async (gx, gy, z) => { const pt = await scene((s, a) => s.clientPosOfPoint(a[0], a[1], a[2]), gx, gy, z); await p.mouse.click(pt.x, pt.y); };
 const clickCell = async (x, y) => { const pt = await scene((s, a) => s.clientPosOfCell(a[0], a[1]), x, y); await p.mouse.click(pt.x, pt.y); };
 const waitIdle = () => p.waitForFunction(() => { const s = document.getElementById('app').__portfolio.scene(); const d = s.debugState(); return !d.moving && d.anim === 'idle'; }, null, { timeout: 15000 });
-const title = () => p.locator('.win h2').innerText();
+const title = () => p.locator('.win h2').textContent();
 const closeWin = async () => { await p.locator('.win .close').click(); await p.waitForFunction(() => !document.getElementById('app').shadowRoot.querySelector('.win')); };
 
 // 0. Интерфейс сверху: только меню и полный экран
@@ -71,7 +71,7 @@ await clickPoint(2.56, 0, 104);
 await p.waitForSelector('.win.modal', { timeout: 15000 });
 ok((await title()) === 'Обо мне', 'рамки на стене открыли «Обо мне»');
 const about = await p.locator('.win .body').innerText();
-ok(about.includes('Георгий Андюл') && about.includes('Графический и веб-дизайнер'), 'в «Обо мне»: имя и профессия');
+ok(about.toLowerCase().includes('георгий андюл') && about.includes('Графический и веб-дизайнер'), 'в «Обо мне»: имя и профессия');
 ok(/около пяти лет/i.test(about), 'в «Обо мне»: около пяти лет');
 ok(about.includes('Вместе Медиа') && about.includes('2024') && about.includes('Лучший брендинг'), 'в «Обо мне»: конкурс «Вместе Медиа», 2024, «Лучший брендинг»');
 ok(about.includes('X5 Group') && about.includes('Перекрёстком') && about.includes('Островком') && about.includes('Smartfon'), 'в «Обо мне»: компании как в ТЗ');
@@ -85,19 +85,19 @@ await closeWin();
 await clickObj('catalog');
 await p.waitForSelector('.win.modal', { timeout: 15000 });
 ok((await title()) === 'Каталог услуг', 'книга на столике открыла «Каталог услуг»');
-const cards = await p.locator('.sv-card .lab').allInnerTexts();
-ok(cards.join('|') === 'Дизайн сайтов|Оформление социальных сетей|Дизайн полиграфии', `три услуги: ${cards.join(' / ')}`);
+const rows = await p.locator('.sv-row .n').allInnerTexts();
+ok(rows.length === 6 && rows[0] === 'Лендинг, сайт-визитка', `список услуг с ценами: ${rows.join(' / ')}`);
 const body = await p.locator('.win .body').innerText();
-ok(body.includes('Стоимость обсуждается индивидуально') && !/\d+\s*(₽|руб|\$|%)/.test(body), 'цены не выдуманы');
-await p.locator('.sv-card').first().click();
+ok(/от 30 000 ₽/.test(body) && body.includes('Что входит в стоимость?'), 'в списке есть цены и блок «Что входит в стоимость?»');
+await p.locator('.sv-row').first().click();
 const detail = await p.locator('.win .body').innerText();
-ok(detail.includes('лендинги') && detail.includes('адаптация дизайна под разные размеры экранов'), 'детали «Дизайн сайтов»');
+ok(detail.includes('структура и прототип страницы') && detail.includes('Есть оплата частями'), 'детали «Лендинг»');
 const hrefs = await p.locator('.win .body a.btn').evaluateAll((a) => a.map((x) => x.href + '|' + x.target));
 ok(hrefs.length === 2 && hrefs.every((h) => h.startsWith('https://t.me/g_andyul|_blank')), 'кнопки связи ведут на https://t.me/g_andyul в новой вкладке');
 await p.screenshot({ path: `${OUT}/services.png` });
 await p.locator('.back').click();
-await p.locator('.sv-card').nth(2).click();
-ok((await p.locator('.win .body').innerText()).includes('афиши'), 'детали «Дизайн полиграфии»');
+await p.locator('.sv-row').nth(4).click();
+ok((await p.locator('.win .body').innerText()).includes('афиши'), 'детали «Полиграфия»');
 await closeWin();
 
 // 6. Телевизор → Telegram
@@ -164,17 +164,13 @@ await p.screenshot({ path: `${OUT}/after-confirm.png` });
 ok(true, 'после гардероба мир продолжает работать (персонаж идёт)');
 await waitIdle();
 
-// 9б. «Образ Георгия» из гардероба: всё собирается из каталога
+// 9б. Категории гардероба
 await clickObj('wardrobe');
 await p.waitForSelector('.win.panel', { timeout: 15000 });
 const cats = await p.locator('.cat').allInnerTexts();
 ok(['Брови', 'Борода'].every((c) => cats.includes(c)), `в гардеробе есть категории бровей и бороды: ${cats.join(', ')}`);
-await p.getByRole('button', { name: 'Применить образ Георгия' }).click();
-await p.waitForTimeout(500);
-await p.getByRole('button', { name: 'Подтвердить' }).click();
-const g = JSON.parse(await p.evaluate(() => localStorage.getItem('avatar-portfolio:appearance:v1')));
-ok(g.hairStyle === 'bald' && g.beard === 'stubble' && g.brows === 'thick' && g.top === 'shirt-blue' && g.accessory === 'chain', 'образ Георгия применяется и сохраняется');
-await p.screenshot({ path: `${OUT}/georgy.png` });
+ok(!(await p.getByRole('button', { name: /образ Георгия/i }).count()), 'в гардеробе нет готового образа Георгия');
+await p.getByRole('button', { name: 'Отмена' }).click().catch(() => p.keyboard.press('Escape'));
 await p.waitForTimeout(700);
 
 // 10. Адреса и меню

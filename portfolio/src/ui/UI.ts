@@ -1,14 +1,14 @@
 import type { Bus } from '../bus';
 import type { ActionDef } from '../config/room';
 import {
-  ABOUT, CTA_DISCUSS, CTA_OFFER, CTA_PRICE, PRICE_NOTE, PROJECTS, SECTIONS, SERVICES, Service, TELEGRAM_URL,
+  ABOUT, CONTACT_FACTS, CONTACT_STEPS, CTA_DISCUSS, CTA_PRICE, INCLUDED, PRICE_NOTE, PROJECTS, SECTIONS, SERVICES, Service, TELEGRAM_URL, TG_CHANNEL,
 } from '../config/sections';
 import { Appearance, CategoryId, DEFAULT_APPEARANCE, GEORGY_APPEARANCE, WARDROBE, WardrobeCategory, WardrobeItem } from '../config/wardrobe';
 import { preloadAppearance, renderCharacterCrop, renderCharacterPreview } from '../game/draw/character';
 import { HAIR_STYLES, preloadHair } from '../game/draw/hair';
 import { findItem } from '../config/wardrobe';
 import { saveAppearance } from '../state/appearance';
-import { AWARD_ART, EMPTY_PROJECTS_ART, SERVICE_ART } from './art';
+import { AWARD_ART, SERVICE_ART } from './art';
 import { injectFonts } from './fonts';
 import { ICONS } from './icons';
 import { CSS } from './styles';
@@ -344,23 +344,31 @@ export class UI {
     const showList = () => {
       hdr.querySelector('.back')?.remove();
       body.innerHTML = '';
-      const grid = el('div', 'sv-grid');
+      const lead = el('p', 'sv-lead'); lead.textContent = 'Для заказа сайта, оформления или презентации напишите в Telegram ' + TG_CHANNEL.handle;
+      const big = el('h3', 'big'); big.innerHTML = `Только<span class="star">${ICONS.star}</span><br>дизайн`;
+      const rows = el('div', 'sv-rows');
       for (const s of SERVICES) {
-        const c = el('button', 'sv-card', `<span class="art">${SERVICE_ART[s.art]}</span><span class="lab"></span>`);
-        c.querySelector('.lab')!.textContent = s.title;
-        c.addEventListener('click', () => showDetail(s));
-        grid.append(c);
+        const r = el('button', 'sv-row', `<span class="n"></span><span class="pr"><b></b><i></i></span>`);
+        r.querySelector('.n')!.textContent = s.short;
+        r.querySelector('b')!.textContent = s.price;
+        r.querySelector('i')!.textContent = `( ${s.days} )`;
+        r.setAttribute('aria-label', `${s.title}: ${s.price}, ${s.days}`);
+        r.addEventListener('click', () => showDetail(s));
+        rows.append(r);
       }
-      const price = el('div', 'sv-price pnl');
-      const t = el('span'); t.textContent = PRICE_NOTE;
-      price.append(t, tgLink(CTA_OFFER));
-      body.append(grid, price);
+      const foot = el('div', 'sv-foot');
+      const l = el('div'); const lt = el('h4'); lt.textContent = 'Что входит в стоимость?'; const ul = el('ul');
+      for (const i of INCLUDED) { const li = el('li'); li.textContent = i; ul.append(li); }
+      l.append(lt, ul);
+      const r = el('div', 'cl'); const rp = el('p'); rp.innerHTML = 'Для расчёта <b>точной стоимости</b> проекта напишите мне в Telegram';
+      r.append(rp, tgLink(CTA_PRICE));
+      foot.append(l, r);
+      body.append(lead, big, rows, foot);
     };
     const showDetail = (s: Service) => {
       body.innerHTML = '';
       hdr.querySelector('.back')?.remove();
       const back = el('button', 'btn dark back', `${ICONS.back}<span>Все услуги</span>`);
-      back.style.minHeight = '34px'; back.style.padding = '0 12px';
       back.addEventListener('click', showList);
       hdr.prepend(back);
       const d = el('div', 'sv-detail');
@@ -370,16 +378,20 @@ export class UI {
       const desc = el('div', 'pnl'); const p = el('p'); p.textContent = s.description; desc.append(p);
       info.append(h, desc);
       d.append(art, info);
-      const lbl = el('div', 'lbl'); lbl.textContent = 'Что входит';
+      const lbl = el('div', 'lbl'); lbl.textContent = 'Что может входить';
       const ul = el('ul', 'inc pnl');
       for (const i of s.includes) { const li = el('li'); li.textContent = i; ul.append(li); }
       const note = el('div', 'pnl'); note.style.marginTop = '10px';
       const np = el('p'); np.textContent = s.note; note.append(np);
-      const price = el('div', 'sv-price');
-      const pt = el('span'); pt.textContent = PRICE_NOTE; price.append(pt);
+      const price = el('div', 'sv-pricebar');
+      const main = el('div', 'main'); main.innerHTML = '<b></b><i></i>';
+      main.querySelector('b')!.textContent = s.price; main.querySelector('i')!.textContent = `( ${s.days} )`;
+      price.append(main);
+      if (s.installments) { const ins = el('div', 'ins'); ins.textContent = 'Есть оплата частями'; price.append(ins); }
+      const pn = el('p', 'sv-note'); pn.textContent = PRICE_NOTE;
       const actions = el('div', 'sv-actions');
-      actions.append(tgLink(CTA_PRICE), tgLink(CTA_DISCUSS, 'btn'));
-      body.append(d, lbl, ul, note, price, actions);
+      actions.append(tgLink(CTA_PRICE), tgLink(CTA_DISCUSS, 'btn orange'));
+      body.append(d, lbl, ul, note, price, pn, actions);
       body.scrollTop = 0;
     };
     showList();
@@ -403,28 +415,58 @@ export class UI {
       body.append(grid);
       return;
     }
-    const e = el('div', 'pj-empty', `<div class="art">${EMPTY_PROJECTS_ART}</div><h3>Подборка работ скоро появится</h3><p class="pnl">Пока можно посмотреть каталог услуг или написать мне в Telegram.</p>`);
-    const row = el('div', 'sv-actions'); row.style.justifyContent = 'center';
+    const h = el('h3', 'big sm'); h.innerHTML = 'Подборка работ<br>скоро появится';
+    const soon = el('div', 'pj-soon');
+    for (const [t, tag] of [['Сайты', 'Лендинги и многостраничные сайты'], ['Соцсети', 'Оформление и шаблоны'], ['Айдентика', 'Фирменный стиль и логотипы']]) {
+      const c = el('div', 'pj-ph', `<div class="im"><span>скоро</span></div><b></b><small></small>`);
+      c.querySelector('b')!.textContent = t; c.querySelector('small')!.textContent = tag;
+      soon.append(c);
+    }
+    const p = el('p', 'pnl'); p.textContent = 'Пока можно посмотреть каталог услуг или написать мне в Telegram — расскажу о похожих проектах и покажу примеры.';
+    const row = el('div', 'sv-actions');
     const services = el('button', 'btn dark', `${ICONS.book}<span>Каталог услуг</span>`);
     services.addEventListener('click', () => this.openById('services', null, false, 'modal'));
     row.append(services, tgLink(CTA_DISCUSS));
-    e.append(row);
-    body.append(e);
+    body.append(h, soon, p, row);
   }
 
   // ---------- Telegram (телевизор) ----------
   private renderTelegram(body: HTMLElement): void {
-    const t = el('div', 'tv', `<div class="screen">${ICONS.telegram}</div><h3>Telegram-канал</h3><p class="url">t.me/g_andyul</p>`);
-    t.append(tgLink('Открыть Telegram'));
-    body.append(t);
+    const hero = el('div', 'tg-hero');
+    hero.innerHTML = `<span class="av">${ICONS.plane}</span><div><b></b><small></small></div>`;
+    hero.querySelector('b')!.textContent = TG_CHANNEL.handle;
+    hero.querySelector('small')!.textContent = TG_CHANNEL.tagline;
+    const big = el('h3', 'big sm'); big.innerHTML = 'Дизайн<br>изнутри';
+    const topics = el('div', 'tags');
+    for (const t of TG_CHANNEL.topics) { const x = el('span', 'tag'); x.textContent = t; topics.append(x); }
+    const lbl = el('div', 'lbl'); lbl.textContent = 'О чём пишу';
+    const posts = el('div', 'tg-posts');
+    for (const p of TG_CHANNEL.posts) {
+      const c = el('div', 'tg-post', `<em></em><b></b>`);
+      c.querySelector('em')!.textContent = p.tag; c.querySelector('b')!.textContent = p.title;
+      posts.append(c);
+    }
+    const cta = el('div', 'cta'); cta.append(tgLink('Открыть Telegram'));
+    body.append(hero, big, topics, cta, lbl, posts);
   }
 
   // ---------- Контакты (дверь) ----------
   private renderContacts(body: HTMLElement): void {
+    const big = el('h3', 'big sm'); big.innerHTML = 'Давайте обсудим<br>вашу задачу';
     const box = el('div', 'pnl');
-    const p = el('p'); p.textContent = 'Написать мне можно в Telegram.'; box.append(p);
-    const cta = el('div', 'cta'); cta.append(tgLink('Открыть Telegram'));
-    body.append(box, cta);
+    const p = el('p'); p.textContent = 'Не обязательно разбираться в дизайне заранее. Расскажите, какая задача стоит перед вами, — я помогу выбрать подходящее решение.'; box.append(p);
+    const facts = el('div', 'tags');
+    for (const t of CONTACT_FACTS) { const x = el('span', 'tag'); x.textContent = t; facts.append(x); }
+    const lbl = el('div', 'lbl'); lbl.textContent = 'Как это работает';
+    const steps = el('div', 'steps');
+    CONTACT_STEPS.forEach((st, i) => {
+      const c = el('div', 'step', `<span class="no"></span><div><b></b><span class="d"></span></div>`);
+      c.querySelector('.no')!.textContent = String(i + 1).padStart(2, '0');
+      c.querySelector('b')!.textContent = st.t; c.querySelector('.d')!.textContent = st.d;
+      steps.append(c);
+    });
+    const cta = el('div', 'cta'); cta.append(tgLink('Написать в Telegram'));
+    body.append(big, box, facts, lbl, steps, cta);
   }
 
   // ---------- Гардероб ----------
@@ -442,15 +484,6 @@ export class UI {
     const cats = el('div', 'col'); cats.setAttribute('role', 'tablist'); cats.setAttribute('aria-label', 'Категории');
     const cells = el('div', 'cells'); cells.setAttribute('role', 'radiogroup');
     const left = el('div', 'col'); left.append(cats);
-    const preset = el('button', 'btn orange preset', `${ICONS.user}<span>Образ Георгия</span>`);
-    preset.setAttribute('aria-label', 'Применить образ Георгия');
-    preset.addEventListener('click', () => {
-      this.working = { ...GEORGY_APPEARANCE };
-      this.bus.emit('preview', { ...this.working });
-      void repaintPortrait(); void renderCells(true);
-      renderCats();
-    });
-    left.append(preset);
     wd.append(portrait, left, cells);
     w.append(wd);
 

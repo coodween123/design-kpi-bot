@@ -12,8 +12,9 @@
     "release": "vite build --config vite.embed.config.ts && cp dist-embed/portfolio-embed.js release/portfolio-embed.js"
   },
   "dependencies": {
-    "@fontsource-variable/inter": "^5.3.0",
+    "@fontsource-variable/manrope": "^5.3.0",
     "@fontsource-variable/nunito": "^5.3.0",
+    "@fontsource-variable/oswald": "^5.3.0",
     "phaser": "^3.90.0"
   },
   "devDependencies": {
